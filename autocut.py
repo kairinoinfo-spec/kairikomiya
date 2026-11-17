@@ -25,6 +25,9 @@ DEFAULTS = {
     "silence": {"threshold_db": -35, "min_silence": 0.6, "pad_before": 0.15, "pad_after": 0.25},
     "youtube": {"width": 1920, "height": 1080, "fps": "source"},
     "encode": {"encoder": "auto", "video_bitrate": "12M", "crf": 18, "audio_bitrate": "192k"},
+    "transcribe": {"model": "auto", "language": "ja"},
+    "clips": {"count_min": 5, "count_max": 15, "length_min": 30, "length_max": 60,
+              "model": "claude-opus-5-5", "channel_info": ""},
 }
 
 # これより短いカットは、つなぎ目が増えるだけなので行わない（秒）

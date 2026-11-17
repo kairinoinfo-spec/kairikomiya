@@ -39,3 +39,36 @@ encoder = "auto"
 video_bitrate = "12M"    # 画質（videotoolbox のとき）。大きいほど高画質・大容量
 crf = 18                 # 画質（x264 のとき）。小さいほど高画質。18〜23 が目安
 audio_bitrate = "192k"   # 音質
+
+
+# ============================================================
+#  ここから下は、切り抜き機能（clip.py）の設定です
+# ============================================================
+
+[transcribe]
+# 文字起こしに使うモデル
+#   "auto"           … Macに合わせて自動で選ぶ（Apple Silicon: large-v3-turbo / Intel: small）
+#   "large-v3-turbo" … 高精度（約1.6GB）。Apple Silicon 向け
+#   "medium"         … 中くらい（約1.5GB）。Intel Mac で精度を上げたいとき（時間はかかります）
+#   "small"          … 軽くて速い（約0.5GB）
+model = "auto"
+language = "ja"
+
+
+[clips]
+# 1本の動画から出す候補の本数
+count_min = 5
+count_max = 15
+
+# 1本の長さ（秒）
+length_min = 30
+length_max = 60
+
+# 候補を選ぶAI
+#   "claude-opus-5-5"   … おすすめ。60分の動画で 50〜100円くらい
+#   "claude-sonnet-5-5" … 料金は約半分。選び方の質は少し下がることがあります
+model = "claude-opus-5-5"
+
+# チャンネルの説明（書いておくと、AIが視聴者に合わせて選びます。空でもOK）
+#   例: "ダンサー兼トラックメイカーの音楽制作記録。見ているのは曲作りを始めたい人。"
+channel_info = ""

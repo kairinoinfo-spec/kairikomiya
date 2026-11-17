@@ -1,3 +1,7 @@
 __pycache__/
 *_autocut/
 .DS_Store
+.venv/
+models/
+api_key.txt
+*_clips/
