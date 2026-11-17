@@ -6,7 +6,11 @@
     python3 clip.py 動画ファイル.mp4
 
 流れ:  文字起こし（Whisper）→ AI（Claude）が候補を選ぶ → 候補の一覧（CSV）を作る
-準備:  bash setup.sh   と   APIキーの保存（README を見てください）
+
+AI の使い方は2通り:
+  - 無料: Claude アプリに自分で貼り付ける（api_key.txt が無いときはこちら）
+  - 自動: Claude API を使う（api_key.txt があるとき。少額の料金がかかる）
+準備:  bash setup.sh
 """
 from __future__ import annotations
 
@@ -105,23 +109,16 @@ def ensure_sdk() -> None:
         "（setup.sh はドラッグ＆ドロップできます）:\n    bash " + str(HERE / "setup.sh"))
 
 
-NO_KEY_MESSAGE = (
-    "APIキーが見つかりません。README の「APIキーを用意する」の手順で、"
-    "clip.py と同じフォルダに api_key.txt を作ってください。")
-
-
 def load_api_key():
-    """api_key.txt の中身を返す。無ければ None（そのときは環境変数などの設定が使われる）"""
+    """api_key.txt の中身を返す。無ければ None"""
     key_file = HERE / "api_key.txt"
     if key_file.exists():
-        key = key_file.read_text(encoding="utf-8").strip()
-        if key:
-            return key
-    if os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN"):
-        return None
-    if (Path.home() / ".config" / "anthropic").exists():  # `ant auth login` 済み
-        return None
-    raise AutocutError(NO_KEY_MESSAGE)
+        return key_file.read_text(encoding="utf-8").strip() or None
+    return None
+
+
+def has_api_credentials() -> bool:
+    return bool(load_api_key() or os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN"))
 
 
 # ------------------------------------------------------------
@@ -251,10 +248,6 @@ def find_clips(segments: list, duration: float, cfg: dict) -> list:
         raise AutocutError("AIの呼び出しでエラーになりました（{}）: {}".format(e.status_code, e.message))
     except anthropic.APIConnectionError:
         raise AutocutError("AIに接続できませんでした。ネット接続を確認してください。")
-    except TypeError as e:  # SDK が認証情報を見つけられなかったとき
-        if "authentication" not in str(e):
-            raise
-        raise AutocutError(NO_KEY_MESSAGE)
 
     if message.stop_reason == "refusal":
         raise AutocutError("AIがこの文字起こしの処理を断りました。別の動画で試すか、内容を教えてください。")
@@ -272,27 +265,89 @@ def find_clips(segments: list, duration: float, cfg: dict) -> list:
         dollars = (usage.input_tokens * PRICES[model][0] + usage.output_tokens * PRICES[model][1]) / 1e6
         line += "（料金の目安: 約{:.0f}円 = ${:.2f}）".format(dollars * YEN_PER_DOLLAR, dollars)
     print(line)
+    return clips_from_answer(raw, segments, duration)
 
+
+def clips_from_answer(raw, segments: list, duration: float) -> list:
+    """AI の返事（行の番号で書かれた範囲）を、時間つきの候補に直す"""
+    if not isinstance(raw, list):
+        raise AutocutError("AIの返事の形が正しくありません。もう一度試してください。")
     by_id = {s["id"]: s for s in segments}
     clips = []
     for c in raw:
-        first, last = by_id.get(c["start_id"]), by_id.get(c["end_id"])
+        try:
+            first, last = by_id.get(int(c["start_id"])), by_id.get(int(c["end_id"]))
+        except (KeyError, TypeError, ValueError):
+            continue
         if first is None or last is None or first["id"] > last["id"]:
             continue  # 存在しない行番号は使えないので捨てる
+        tags = c.get("hashtags") or []
+        if isinstance(tags, str):
+            tags = tags.split()
         clips.append({
             # 話し始めと話し終わりが切れないよう、少しだけ余白を足す
             "start": max(0.0, first["start"] - 0.15),
             "end": min(duration, last["end"] + 0.3),
-            "title": c["title"].strip(),
+            "title": str(c.get("title", "")).strip(),
             "hook": first["text"],
-            "summary": c["summary"].strip(),
-            "reason": c["reason"].strip(),
-            "description": c["description"].strip(),
-            "hashtags": " ".join(t if t.startswith("#") else "#" + t for t in c["hashtags"]),
+            "summary": str(c.get("summary", "")).strip(),
+            "reason": str(c.get("reason", "")).strip(),
+            "description": str(c.get("description", "")).strip(),
+            "hashtags": " ".join(t if t.startswith("#") else "#" + t for t in tags),
         })
     if len(clips) < len(raw):
         print("  （AIの返事のうち {} 本は範囲が正しくなかったので除きました）".format(len(raw) - len(clips)))
     return clips
+
+
+# ------------------------------------------------------------
+# 無料の方法: Claude アプリに自分で貼り付ける
+# ------------------------------------------------------------
+ANSWER_FORMAT = """\
+答えは、下の形のJSONだけを、コードブロックに入れて返してください。前置きや説明の文章は不要です。
+
+```json
+{"clips": [
+  {"start_id": 最初の行の番号, "end_id": 最後の行の番号（この行まで含む）,
+   "title": "動画の冒頭に大きく出すタイトル。20文字以内",
+   "summary": "内容の要約。1〜2文",
+   "reason": "なぜここを選んだか。1〜2文",
+   "description": "投稿に添える説明文。2〜3文",
+   "hashtags": ["#ハッシュタグ", "3〜5個"]}
+]}
+```
+"""
+
+
+def clipboard(text=None):
+    """text を渡すとコピー、渡さないと貼り付け（Mac の pbcopy / pbpaste）。使えなければ None"""
+    exe = shutil.which("pbcopy" if text is not None else "pbpaste")
+    if not exe:
+        return None
+    r = subprocess.run([exe], input=text.encode("utf-8") if text is not None else None,
+                       stdout=subprocess.PIPE)
+    return r.stdout.decode("utf-8", errors="replace") if r.returncode == 0 else None
+
+
+def write_prompt(path: Path, segments: list, duration: float, cfg: dict) -> bool:
+    """Claude アプリに貼る依頼文を作る。クリップボードにコピーできたら True"""
+    text = "\n\n".join([SYSTEM_PROMPT.strip(), ANSWER_FORMAT.strip(),
+                         build_user_prompt(segments, duration, cfg)]) + "\n"
+    path.write_text(text, encoding="utf-8")
+    return clipboard(text) is not None
+
+
+def read_pasted_answer() -> list:
+    text = clipboard()
+    if text is None:
+        raise AutocutError("クリップボードを読めませんでした。")
+    start, end = text.find("{"), text.rfind("}")
+    try:
+        return json.loads(text[start:end + 1])["clips"]
+    except (ValueError, KeyError, TypeError):
+        raise AutocutError(
+            "コピーされている内容が、Claude の返事（JSON）ではないようです。\n"
+            "Claude の返事のコードブロック右上にある「コピー」を押してから、もう一度実行してください。")
 
 
 # ------------------------------------------------------------
@@ -322,23 +377,26 @@ def main(argv=None) -> int:
     p = argparse.ArgumentParser(description="長い動画から、ショート動画の切り抜き候補を探して一覧にします。")
     p.add_argument("video", type=Path, help="元の動画ファイル（mp4 / mov）")
     p.add_argument("--config", type=Path, help="設定ファイル（省略すると clip.py と同じ場所の config.toml）")
-    p.add_argument("--redo", action="store_true", help="候補の一覧がすでにあっても、AIに選び直してもらう")
+    p.add_argument("--paste", action="store_true", help="Claude アプリからコピーした返事を読み込んで、一覧を作る")
+    p.add_argument("--redo", action="store_true", help="（API を使う場合）候補の一覧がすでにあっても、AIに選び直してもらう")
     args = p.parse_args(argv)
 
     src = args.video.expanduser()
     if not src.is_file():
         raise AutocutError("動画ファイルが見つかりません: {}".format(src))
     cfg = autocut.load_config(args.config)
-    ensure_sdk()
-    load_api_key()  # 時間のかかる文字起こしの前に、キーがあるか確かめておく
+    use_api = has_api_credentials() and not args.paste
+    if use_api:
+        ensure_sdk()
 
     out_dir = src.parent / (src.stem + "_clips")
     out_dir.mkdir(exist_ok=True)
     transcript_json = out_dir / (src.stem + "_transcript.json")
     transcript_txt = out_dir / (src.stem + "_transcript.txt")
     csv_path = out_dir / (src.stem + "_candidates.csv")
+    prompt_path = out_dir / (src.stem + "_prompt.txt")
 
-    if csv_path.exists() and not args.redo:
+    if use_api and csv_path.exists() and not args.redo:
         raise AutocutError(
             "候補の一覧がすでにあります: {}\n"
             "選び直したいときは、コマンドの最後に  --redo  を足してください"
@@ -358,7 +416,21 @@ def main(argv=None) -> int:
             "\n".join("[{}] {}".format(fmt_clock(s["start"]), s["text"]) for s in segments) + "\n",
             encoding="utf-8")
 
-    clips = find_clips(segments, meta["duration"], cfg["clips"])
+    if args.paste:
+        clips = clips_from_answer(read_pasted_answer(), segments, meta["duration"])
+    elif use_api:
+        clips = find_clips(segments, meta["duration"], cfg["clips"])
+    else:
+        copied = write_prompt(prompt_path, segments, meta["duration"], cfg["clips"])
+        print("✔ Claude への依頼文を作りました: " + str(prompt_path))
+        print("  次の手順で、候補を選んでもらってください。")
+        if copied:
+            print("  1. Claude アプリで新しいチャットを開き、貼り付けて（⌘V）送信する（依頼文はコピー済みです）")
+        else:
+            print("  1. Claude アプリで新しいチャットを開き、上のファイルをドラッグ＆ドロップして送信する")
+        print("  2. 返事のコードブロック右上の「コピー」を押す")
+        print("  3. さっきのコマンドの最後に  --paste  を足して、もう一度実行する")
+        return 0
     if not clips:
         raise AutocutError("切り抜きに向いた部分が見つかりませんでした。")
     if csv_path.exists():
