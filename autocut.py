@@ -27,7 +27,7 @@ DEFAULTS = {
     "encode": {"encoder": "auto", "video_bitrate": "12M", "crf": 18, "audio_bitrate": "192k"},
     "transcribe": {"model": "auto", "language": "ja"},
     "clips": {"count_min": 5, "count_max": 15, "length_min": 30, "length_max": 60,
-              "model": "claude-opus-5-5", "channel_info": ""},
+              "model": "claude-opus-5-5", "channel_info": "", "shape": "tate"},
 }
 
 # これより短いカットは、つなぎ目が増えるだけなので行わない（秒）
@@ -155,13 +155,21 @@ def probe(path: Path) -> dict:
             return 0.0
 
     fps = rate("avg_frame_rate") or rate("r_frame_rate") or 30.0
+    # iPhone の縦撮りは「横向きの映像＋回転の指示」で記録されているので、見た目の向きに直す
+    rotation = 0
+    for side in video.get("side_data_list", []):
+        rotation = side.get("rotation", rotation)
+    rotation = int(float(video.get("tags", {}).get("rotate", rotation)))
+    width, height = video.get("width"), video.get("height")
+    if abs(rotation) % 180 == 90:
+        width, height = height, width
     return {
         "duration": float(info["format"]["duration"]),
         "fps": snap_fps(fps),
         "video_index": video["index"],
         "audio_index": audio["index"],
-        "width": video.get("width"),
-        "height": video.get("height"),
+        "width": width,
+        "height": height,
         "hdr": video.get("color_transfer") in ("arib-std-b67", "smpte2084"),
     }
 
@@ -279,37 +287,26 @@ def choose_encoder(cfg: dict) -> list:
     return order
 
 
-def render(src: Path, dst: Path, keeps: list, meta: dict, out_cfg: dict, enc_cfg: dict) -> None:
-    fps = meta["fps"] if out_cfg["fps"] == "source" else snap_fps(float(out_cfg["fps"]))
-    w, h = int(out_cfg["width"]), int(out_cfg["height"])
-    out_duration = sum(b - a for a, b in keeps)
+def hdr_filters(meta: dict):
+    """HDR の動画をふつうの明るさ（SDR）に直すフィルタと、書き出し時の色の指定を返す"""
+    if not meta["hdr"]:
+        return [], []
+    if not ffmpeg_has("filters", "zscale"):
+        print("  ⚠ この動画は HDR で撮影されています。色が白っぽく（薄く）なる場合は教えてください。")
+        return [], []
+    return (["zscale=t=linear:npl=100", "format=gbrpf32le", "zscale=p=bt709",
+             "tonemap=tonemap=hable:desat=0", "zscale=t=bt709:m=bt709:r=tv"],
+            ["-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709"])
 
-    vf = ["fps={}/{}".format(fps.numerator, fps.denominator),
-          # コマの時刻は誤差を含むので、半コマ分ずらして判定する
-          "select='{}'".format(select_expr(keeps, shift=float(1 / fps) / 2)),
-          "setpts=N/FRAME_RATE/TB"]
-    color_args = []
-    if meta["hdr"]:
-        if ffmpeg_has("filters", "zscale"):
-            # iPhone の HDR 動画を、ふつうの明るさ（SDR）に変換する
-            vf += ["zscale=t=linear:npl=100", "format=gbrpf32le", "zscale=p=bt709",
-                   "tonemap=tonemap=hable:desat=0", "zscale=t=bt709:m=bt709:r=tv"]
-            color_args = ["-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709"]
-        else:
-            print("  ⚠ この動画は HDR で撮影されています。色が白っぽく（薄く）なる場合は教えてください。")
-    vf += ["scale={}:{}:force_original_aspect_ratio=decrease".format(w, h),
-           "pad={}:{}:(ow-iw)/2:(oh-ih)/2".format(w, h), "setsar=1", "format=yuv420p"]
-    # 音声は細かく刻んでから選ぶ（カットを重ねても映像と音がずれないように）
-    af = ["aresample=48000", "asetnsamples=n=128:p=0",
-          "aselect='{}'".format(select_expr(keeps)), "asetpts=N/SR/TB"]
-    graph = "[0:{}]{}[v];[0:{}]{}[a]".format(
-        meta["video_index"], ",".join(vf), meta["audio_index"], ",".join(af))
 
+def run_encode(input_args: list, graph: str, dst: Path, out_duration: float,
+               enc_cfg: dict, color_args: list) -> None:
+    """ffmpeg で書き出す。graph は [v] と [a] を出力するフィルタ。進み具合を表示する"""
     tmp = dst.with_name(dst.stem + ".part.mp4")
     last_error = ""
     for enc in choose_encoder(enc_cfg):
-        cmd = (["ffmpeg", "-hide_banner", "-y", "-loglevel", "error", "-nostats", "-i", str(src),
-                "-filter_complex", graph, "-map", "[v]", "-map", "[a]"]
+        cmd = (["ffmpeg", "-hide_banner", "-y", "-loglevel", "error", "-nostats"] + input_args
+               + ["-filter_complex", graph, "-map", "[v]", "-map", "[a]"]
                + enc + color_args
                + ["-c:a", "aac", "-b:a", str(enc_cfg["audio_bitrate"]),
                   "-movflags", "+faststart", "-progress", "pipe:1", str(tmp)])
@@ -332,6 +329,25 @@ def render(src: Path, dst: Path, keeps: list, meta: dict, out_cfg: dict, enc_cfg
             tmp.unlink()
         print("  （{} での書き出しに失敗したので、別の方式で試します）".format(enc[1]))
     raise AutocutError("書き出しに失敗しました:\n" + last_error)
+
+
+def render(src: Path, dst: Path, keeps: list, meta: dict, out_cfg: dict, enc_cfg: dict) -> None:
+    fps = meta["fps"] if out_cfg["fps"] == "source" else snap_fps(float(out_cfg["fps"]))
+    w, h = int(out_cfg["width"]), int(out_cfg["height"])
+    hdr, color_args = hdr_filters(meta)
+    vf = (["fps={}/{}".format(fps.numerator, fps.denominator),
+           # コマの時刻は誤差を含むので、半コマ分ずらして判定する
+           "select='{}'".format(select_expr(keeps, shift=float(1 / fps) / 2)),
+           "setpts=N/FRAME_RATE/TB"]
+          + hdr
+          + ["scale={}:{}:force_original_aspect_ratio=decrease".format(w, h),
+             "pad={}:{}:(ow-iw)/2:(oh-ih)/2".format(w, h), "setsar=1", "format=yuv420p"])
+    # 音声は細かく刻んでから選ぶ（カットを重ねても映像と音がずれないように）
+    af = ["aresample=48000", "asetnsamples=n=128:p=0",
+          "aselect='{}'".format(select_expr(keeps)), "asetpts=N/SR/TB"]
+    graph = "[0:{}]{}[v];[0:{}]{}[a]".format(
+        meta["video_index"], ",".join(vf), meta["audio_index"], ",".join(af))
+    run_encode(["-i", str(src)], graph, dst, sum(b - a for a, b in keeps), enc_cfg, color_args)
 
 
 # ------------------------------------------------------------

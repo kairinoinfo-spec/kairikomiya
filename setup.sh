@@ -14,6 +14,6 @@ brew install ffmpeg whisper-cpp python
 
 echo "▶ このツール専用の Python 環境を作っています"
 "$(brew --prefix)/bin/python3" -m venv .venv
-.venv/bin/pip install --quiet --upgrade pip anthropic
+.venv/bin/pip install --quiet --upgrade pip anthropic "opencv-python-headless>=4.10,<5"
 
 echo "✔ 準備ができました"

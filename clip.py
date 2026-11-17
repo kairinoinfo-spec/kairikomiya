@@ -7,6 +7,8 @@
 
 流れ:  文字起こし（Whisper）→ AI（Claude）が候補を選ぶ → 候補の一覧（CSV）を作る
 
+    python3 clip.py 動画ファイル.mp4 --export tate yoko    … 一覧で「はい」の候補を書き出す
+
 AI の使い方は2通り:
   - 無料: Claude アプリに自分で貼り付ける（api_key.txt が無いときはこちら）
   - 自動: Claude API を使う（api_key.txt があるとき。少額の料金がかかる）
@@ -19,6 +21,7 @@ import csv
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -43,8 +46,18 @@ YEN_PER_DOLLAR = 150
 # AI が安全上の理由で応答を止めたとき、別モデルで自動的にやり直す機能に対応しているモデル
 FALLBACK_MODELS = ("claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-2")
 
-CSV_COLUMNS = ["番号", "使う", "開始", "終了", "長さ(秒)", "タイトル案", "冒頭のセリフ",
+CSV_COLUMNS = ["番号", "使う", "開始", "終了", "長さ(秒)", "形", "位置", "タイトル案", "冒頭のセリフ",
                "要約", "選んだ理由", "説明文", "ハッシュタグ"]
+
+# 書き出す形: 名前 → (ファイル名に付ける言葉, 幅, 高さ)
+SHAPES = {
+    "tate": ("縦", 1080, 1920),      # 9:16  ショート / TikTok / リール
+    "yoko": ("横", 1920, 1080),      # 16:9  YouTube
+    "square": ("正方形", 1080, 1080),  # 1:1   Instagram フィード
+    "feed": ("4x5", 1080, 1350),     # 4:5   Instagram フィード
+}
+SHAPE_ALIASES = {"縦": "tate", "9:16": "tate", "横": "yoko", "16:9": "yoko",
+                 "正方形": "square", "1:1": "square", "4:5": "feed", "4x5": "feed"}
 
 CLIP_SCHEMA = {
     "type": "object",
@@ -94,19 +107,21 @@ SYSTEM_PROMPT = """\
 # ------------------------------------------------------------
 # 準備の確認
 # ------------------------------------------------------------
-def ensure_sdk() -> None:
-    """Claude を呼ぶための部品（anthropic）が入った Python で動かし直す"""
+def ensure_module(name: str, required: bool = True) -> bool:
+    """追加の部品（anthropic / cv2）が入った専用の Python で動かし直す"""
     try:
-        import anthropic  # noqa: F401
-        return
+        __import__(name)
+        return True
     except ImportError:
         pass
     venv_python = VENV / "bin" / "python"
     if venv_python.exists() and Path(sys.prefix).resolve() != VENV.resolve():
         os.execv(str(venv_python), [str(venv_python)] + sys.argv)
-    raise AutocutError(
-        "切り抜き機能の準備がまだです。ターミナルで次を実行してください"
-        "（setup.sh はドラッグ＆ドロップできます）:\n    bash " + str(HERE / "setup.sh"))
+    if required:
+        raise AutocutError(
+            "切り抜き機能の準備がまだです。ターミナルで次を実行してください"
+            "（setup.sh はドラッグ＆ドロップできます）:\n    bash " + str(HERE / "setup.sh"))
+    return False
 
 
 def load_api_key():
@@ -359,8 +374,171 @@ def write_candidates_csv(path: Path, clips: list) -> None:
         w.writerow(CSV_COLUMNS)
         for i, c in enumerate(clips, 1):
             w.writerow([i, autocut.YES, fmt_clock(c["start"]), fmt_clock(c["end"]),
-                        "{:.1f}".format(c["end"] - c["start"]), c["title"], c["hook"],
+                        "{:.1f}".format(c["end"] - c["start"]), "", "", c["title"], c["hook"],
                         c["summary"], c["reason"], c["description"], c["hashtags"]])
+
+
+# ------------------------------------------------------------
+# 書き出し（一覧で「はい」の候補を、選んだ形で書き出す）
+# ------------------------------------------------------------
+def parse_shapes(text: str) -> list:
+    shapes = []
+    for word in re.split(r"[,、・/\s　]+", str(text).strip()):
+        if not word:
+            continue
+        name = SHAPE_ALIASES.get(word, word.lower())
+        if name not in SHAPES:
+            raise AutocutError("形の名前「{}」が分かりません。使えるのは tate（縦）/ yoko（横）/ square（正方形）/ feed（4:5）です。".format(word))
+        if name not in shapes:
+            shapes.append(name)
+    return shapes
+
+
+def parse_clock(text: str) -> float:
+    """「12:34.5」「1:02:34.5」「83.4」「1分23秒」「1m 23.4s」などを秒に直す"""
+    t = str(text).strip().replace("：", ":")
+    units = re.findall(r"([\d.]+)\s*(時間|h|分|m|秒|s)", t)
+    if units:
+        scale = {"時間": 3600, "h": 3600, "分": 60, "m": 60, "秒": 1, "s": 1}
+        return sum(float(v) * scale[u] for v, u in units)
+    total = 0.0
+    for part in t.split(":"):
+        total = total * 60 + float(part)
+    return total
+
+
+def read_candidates_csv(path: Path, duration: float, default_shapes: list) -> list:
+    if not path.exists():
+        raise AutocutError("候補の一覧が見つかりません: {}\n先に候補を作ってください（README の「切り抜き」）。".format(path))
+    clips = []
+    with path.open(encoding="utf-8-sig", newline="") as f:
+        for n, row in enumerate(csv.DictReader(f), 1):
+            flag = (row.get("使う") or "").strip().lower()
+            if flag in (autocut.NO, "no", "n", "0", "false", "×", "x", ""):
+                continue
+            where = "候補の一覧の {} 行目（番号 {}）".format(n + 1, row.get("番号", "?"))
+            try:
+                start, end = parse_clock(row["開始"]), parse_clock(row["終了"])
+            except (KeyError, TypeError, ValueError):
+                raise AutocutError(where + "の「開始」「終了」が読めません。12:34.5 のように書いてください。")
+            end = min(end, duration)
+            if not 0 <= start < end:
+                raise AutocutError(where + "の時間が正しくありません（開始 {} / 終了 {} / 動画の長さ {}）。".format(
+                    row["開始"], row["終了"], fmt_clock(duration)))
+            pos = (row.get("位置") or "").strip().rstrip("%％")
+            try:
+                pos = min(100.0, max(0.0, float(pos))) if pos else None
+            except ValueError:
+                raise AutocutError(where + "の「位置」は 0〜100 の数字で書いてください（空なら自動）。")
+            try:
+                number = int(float(row.get("番号") or n))
+            except ValueError:
+                number = n
+            clips.append({"no": number, "start": start, "end": end,
+                          "title": (row.get("タイトル案") or "").strip(),
+                          "shapes": parse_shapes(row.get("形") or "") or default_shapes, "pos": pos})
+    return clips
+
+
+def find_subject(src: Path, meta: dict, start: float, length: float):
+    """クリップの中の人物の位置を探す。(横位置, 縦位置, 説明) を 0〜1 で返す。見つからなければ None"""
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        return None
+    scale = 640.0 / max(meta["width"], meta["height"])
+    w, h = int(meta["width"] * scale) // 2 * 2, int(meta["height"] * scale) // 2 * 2
+    # 1秒に1コマだけ、小さい白黒画像で取り出して調べる
+    r = subprocess.run(
+        ["ffmpeg", "-v", "error", "-ss", "{:.3f}".format(start), "-t", "{:.3f}".format(length),
+         "-i", str(src), "-map", "0:{}".format(meta["video_index"]),
+         "-vf", "fps=1,scale={}:{}".format(w, h), "-f", "rawvideo", "-pix_fmt", "gray", "-"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    count = len(r.stdout) // (w * h)
+    if r.returncode != 0 or count == 0:
+        return None
+    frames = np.frombuffer(r.stdout[:count * w * h], dtype=np.uint8).reshape(count, h, w)
+    enough = max(2, count // 5)  # 全体の2割以上のコマで見つかったら採用
+
+    face = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+    small = max(24, min(w, h) // 12)
+    found = []
+    for frame in frames:
+        boxes = face.detectMultiScale(frame, scaleFactor=1.1, minNeighbors=6, minSize=(small, small))
+        if len(boxes):
+            x, y, bw, bh = max(boxes, key=lambda b: b[2] * b[3])  # いちばん大きい顔
+            found.append(((x + bw / 2) / w, (y + bh / 2) / h))
+    kind = "顔"
+    if len(found) < enough:  # 顔が小さい・写っていないときは、全身を探す
+        hog = cv2.HOGDescriptor()
+        hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+        found = []
+        for frame in frames:
+            boxes, weights = hog.detectMultiScale(frame, winStride=(8, 8), scale=1.05)
+            if len(boxes) and float(max(weights)) > 0.5:
+                x, y, bw, bh = boxes[int(np.argmax(weights))]
+                found.append(((x + bw / 2) / w, (y + bh * 0.3) / h))  # 上半身あたりを中心に
+        kind = "全身"
+    if len(found) < enough:
+        return None
+    return float(np.median([p[0] for p in found])), float(np.median([p[1] for p in found])), kind
+
+
+def crop_box(meta: dict, tw: int, th: int, subject, pos):
+    """元の映像から切り出す範囲 (幅, 高さ, 左, 上) を決める。画面いっぱいに映るように切る"""
+    W, H = meta["width"], meta["height"]
+    if W * th > H * tw:   # 元のほうが横長 → 左右を切る
+        cw, ch = min(W, int(H * tw / th) // 2 * 2), H
+    else:                 # 元のほうが縦長 → 上下を切る
+        cw, ch = W, min(H, int(W * th / tw) // 2 * 2)
+    if pos is not None:   # 一覧の「位置」で手動指定（0=左/上, 50=中央, 100=右/下）
+        x, y = (W - cw) * pos / 100, (H - ch) * pos / 100
+    elif subject:
+        x = subject[0] * W - cw / 2
+        y = subject[1] * H - ch * 0.4   # 上下を切るときは、人物を少し上寄りに置く
+    else:
+        x, y = (W - cw) / 2, (H - ch) / 2
+    return cw, ch, int(min(max(x, 0), W - cw)), int(min(max(y, 0), H - ch))
+
+
+def safe_name(title: str) -> str:
+    name = re.sub(r'[\\/:*?"<>|\r\n\t]', "", title).strip(" .")
+    return name[:30] or "clip"
+
+
+def export_clips(src: Path, meta: dict, clips: list, out_dir: Path, cfg: dict) -> list:
+    out_dir.mkdir(exist_ok=True)
+    fps = meta["fps"]
+    hdr, color_args = autocut.hdr_filters(meta)
+    made = []
+    for clip in clips:
+        length = clip["end"] - clip["start"]
+        print("▶ {:02d} {}（{}〜{}、{:.0f}秒）".format(
+            clip["no"], clip["title"], fmt_clock(clip["start"]), fmt_clock(clip["end"]), length))
+        targets = [(SHAPES[name][0], SHAPES[name][1], SHAPES[name][2]) for name in clip["shapes"]]
+        # 元の映像と形が違うときだけ、どこを切り出すか決める必要がある
+        needs_crop = any(tw * meta["height"] != th * meta["width"] for _, tw, th in targets)
+        subject = None
+        if needs_crop and clip["pos"] is None:
+            subject = find_subject(src, meta, clip["start"], length)
+            if subject:
+                print("  人物の位置: {}を見つけました（左から {:.0f}%）".format(subject[2], subject[0] * 100))
+            else:
+                print("  人物の位置: 見つからなかったので、中央で切り出します")
+        for label, tw, th in targets:
+            cw, ch, x, y = crop_box(meta, tw, th, subject, clip["pos"])
+            vf = (["fps={}/{}".format(fps.numerator, fps.denominator)] + hdr
+                  + ["crop={}:{}:{}:{}".format(cw, ch, x, y), "scale={}:{}".format(tw, th),
+                     "setsar=1", "format=yuv420p"])
+            graph = "[0:{}]{}[v];[0:{}]aresample=48000[a]".format(
+                meta["video_index"], ",".join(vf), meta["audio_index"])
+            dst = out_dir / "{}_{:02d}_{}_{}.mp4".format(src.stem, clip["no"], safe_name(clip["title"]), label)
+            print("  {}（{}x{}）".format(label, tw, th))
+            autocut.run_encode(["-ss", "{:.3f}".format(clip["start"]), "-t", "{:.3f}".format(length), "-i", str(src)],
+                               graph, dst, length, cfg["encode"], color_args)
+            made.append(dst)
+    return made
 
 
 def backup(path: Path) -> Path:
@@ -378,6 +556,10 @@ def main(argv=None) -> int:
     p.add_argument("video", type=Path, help="元の動画ファイル（mp4 / mov）")
     p.add_argument("--config", type=Path, help="設定ファイル（省略すると clip.py と同じ場所の config.toml）")
     p.add_argument("--paste", action="store_true", help="Claude アプリからコピーした返事を読み込んで、一覧を作る")
+    p.add_argument("--export", nargs="*", metavar="形",
+                   help="一覧で「はい」の候補を書き出す。形は tate（縦 9:16）/ yoko（横 16:9）/ square（1:1）/ feed（4:5）。"
+                        "複数並べると全部作る。省略すると config.toml の shape")
+    p.add_argument("--list", type=Path, help="（--export のとき）別の場所に保存した候補の一覧（CSV）を使う")
     p.add_argument("--redo", action="store_true", help="（API を使う場合）候補の一覧がすでにあっても、AIに選び直してもらう")
     args = p.parse_args(argv)
 
@@ -385,9 +567,25 @@ def main(argv=None) -> int:
     if not src.is_file():
         raise AutocutError("動画ファイルが見つかりません: {}".format(src))
     cfg = autocut.load_config(args.config)
+    if args.export is not None:
+        ensure_module("cv2", required=False)  # 人物の位置を探す部品。無ければ中央で切り出す
+        shapes = parse_shapes(" ".join(args.export)) or parse_shapes(cfg["clips"]["shape"]) or ["tate"]
+        out_dir = src.parent / (src.stem + "_clips")
+        csv_path = args.list.expanduser() if args.list else out_dir / (src.stem + "_candidates.csv")
+        print("▶ 動画を調べています: " + src.name)
+        meta = autocut.probe(src)
+        clips = read_candidates_csv(csv_path, meta["duration"], shapes)
+        if not clips:
+            raise AutocutError("一覧に「使う」が「はい」の候補がありません: {}".format(csv_path))
+        print("  {} 本を書き出します（一覧: {}）".format(len(clips), csv_path.name))
+        out_dir.mkdir(exist_ok=True)
+        made = export_clips(src, meta, clips, out_dir / "書き出し", cfg)
+        print("✔ {} 本の動画ができました: {}".format(len(made), out_dir / "書き出し"))
+        return 0
+
     use_api = has_api_credentials() and not args.paste
     if use_api:
-        ensure_sdk()
+        ensure_module("anthropic")
 
     out_dir = src.parent / (src.stem + "_clips")
     out_dir.mkdir(exist_ok=True)
