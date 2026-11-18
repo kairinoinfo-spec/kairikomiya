@@ -28,6 +28,10 @@ DEFAULTS = {
     "transcribe": {"model": "auto", "language": "ja"},
     "clips": {"count_min": 5, "count_max": 15, "length_min": 30, "length_max": 60,
               "model": "claude-opus-5-5", "channel_info": "", "shape": "tate"},
+    "title": {"enabled": True, "seconds": 2.0, "size": 96, "color": "#FFE600", "outline": "#000000",
+              "outline_width": 10, "band": "", "position_tate": 20, "position_yoko": 14, "font": ""},
+    "subtitle": {"enabled": True, "size": 64, "color": "#FFFFFF", "outline": "#000000", "outline_width": 7,
+                 "band": "", "max_chars": 24, "position_tate": 72, "position_yoko": 88, "font": ""},
 }
 
 # これより短いカットは、つなぎ目が増えるだけなので行わない（秒）

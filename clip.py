@@ -32,7 +32,12 @@ import autocut
 from autocut import AutocutError
 
 HERE = Path(__file__).resolve().parent
-VENV = HERE / ".venv"
+# ツールを新しくダウンロードし直しても消えないように、大きなものはここに置く
+if platform.system() == "Darwin":
+    APP_DIR = Path.home() / "Library" / "Application Support" / "kairikomiya"
+else:
+    APP_DIR = Path.home() / ".local" / "share" / "kairikomiya"
+VENVS = [APP_DIR / "venv", HERE / ".venv"]
 MODEL_URL = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-{}.bin"
 
 # 料金の目安を表示するための単価（100万トークンあたりのドル: 入力, 出力）
@@ -114,9 +119,10 @@ def ensure_module(name: str, required: bool = True) -> bool:
         return True
     except ImportError:
         pass
-    venv_python = VENV / "bin" / "python"
-    if venv_python.exists() and Path(sys.prefix).resolve() != VENV.resolve():
-        os.execv(str(venv_python), [str(venv_python)] + sys.argv)
+    for venv in VENVS:
+        venv_python = venv / "bin" / "python"
+        if venv_python.exists() and Path(sys.prefix).resolve() != venv.resolve():
+            os.execv(str(venv_python), [str(venv_python)] + sys.argv)
     if required:
         raise AutocutError(
             "切り抜き機能の準備がまだです。ターミナルで次を実行してください"
@@ -143,10 +149,18 @@ def whisper_model_path(name: str) -> Path:
     if name == "auto":
         # Apple Silicon なら高精度モデル、Intel Mac なら軽いモデル
         name = "large-v3-turbo" if platform.machine() == "arm64" else "small"
-    path = HERE / "models" / "ggml-{}.bin".format(name)
+    filename = "ggml-{}.bin".format(name)
+    path = APP_DIR / "models" / filename
     if path.exists():
         return path
-    path.parent.mkdir(exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # 前の版のツールのフォルダにダウンロード済みなら、それを移して使う（1.6GBを再ダウンロードしない）
+    old = [HERE / "models" / filename] + sorted(HERE.parent.glob("kairikomiya*/models/" + filename))
+    for o in old:
+        if o.exists():
+            shutil.move(str(o), str(path))
+            print("▶ 前にダウンロードした文字起こし用のモデルを使います")
+            return path
     print("▶ 文字起こし用のモデル（{}）をダウンロードします。最初の1回だけです".format(name))
     part = path.with_name(path.name + ".part")
     r = subprocess.run(["curl", "-L", "--fail", "-#", "-o", str(part), MODEL_URL.format(name)])
@@ -452,6 +466,8 @@ def read_candidates_csv(path: Path, duration: float, default_shapes: list) -> li
                 number = n
             clips.append({"no": number, "start": start, "end": end,
                           "title": (row.get("タイトル案") or "").strip(),
+                          "description": (row.get("説明文") or "").strip(),
+                          "hashtags": (row.get("ハッシュタグ") or "").strip(),
                           "shapes": parse_shapes(row.get("形") or "") or default_shapes, "pos": pos})
     return clips
 
@@ -523,18 +539,63 @@ def safe_name(title: str) -> str:
     return name[:30] or "clip"
 
 
-def export_clips(src: Path, meta: dict, clips: list, out_dir: Path, cfg: dict) -> list:
+def clip_subtitles(clip: dict, segments, sub_dir: Path, src: Path, cfg: dict):
+    """クリップの字幕を用意する。手で直した .srt があればそれを使う"""
+    import telop
+    if not segments or not cfg["subtitle"]["enabled"]:
+        return []
+    sub_dir.mkdir(exist_ok=True)
+    srt = sub_dir / "{}_{:02d}.srt".format(src.stem, clip["no"])
+    info = srt.with_suffix(".json")
+    span = {"start": round(clip["start"], 2), "end": round(clip["end"], 2)}
+    if srt.exists() and info.exists():
+        try:
+            same = json.loads(info.read_text(encoding="utf-8")) == span
+        except ValueError:
+            same = False
+        if same:
+            subs = telop.read_srt(srt)
+            print("  字幕: {} を使います（{}個）".format(srt.name, len(subs)))
+            return subs
+        old = backup(srt)
+        print("  字幕: 開始・終了が変わったので作り直します（前の字幕は {} に残しました）".format(old.name))
+    subs = telop.subtitles_for_clip(segments, clip["start"], clip["end"], int(cfg["subtitle"]["max_chars"]))
+    telop.write_srt(srt, subs)
+    info.write_text(json.dumps(span), encoding="utf-8")
+    print("  字幕: {}個 作りました（{}）".format(len(subs), srt.name))
+    return subs
+
+
+def write_post_text(path: Path, src: Path, clips: list, made: dict) -> None:
+    """投稿するときにコピーして使う、タイトル・説明文・ハッシュタグのまとめ"""
+    lines = ["{} の切り抜き 投稿用テキスト".format(src.name), ""]
+    for clip in clips:
+        lines.append("=" * 40)
+        lines.append("{:02d}  {}".format(clip["no"], clip["title"]))
+        for f in made.get(clip["no"], []):
+            lines.append("    動画: " + f.name)
+        lines += ["", "【タイトル】", clip["title"], "", "【説明文】", clip["description"] or "（なし）", "",
+                  "【ハッシュタグ】", clip["hashtags"] or "（なし）", "",
+                  "【説明文＋ハッシュタグ（そのまま貼る用）】",
+                  "\n\n".join(x for x in (clip["description"], clip["hashtags"]) if x), ""]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def export_clips(src: Path, meta: dict, clips: list, out_dir: Path, cfg: dict, segments=None) -> list:
+    import tempfile
+    import telop
     out_dir.mkdir(exist_ok=True)
     fps = meta["fps"]
     hdr, color_args = autocut.hdr_filters(meta)
-    made = []
+    made = {}
     for clip in clips:
         length = clip["end"] - clip["start"]
         print("▶ {:02d} {}（{}〜{}、{:.0f}秒）".format(
             clip["no"], clip["title"], fmt_clock(clip["start"]), fmt_clock(clip["end"]), length))
-        targets = [(SHAPES[name][0], SHAPES[name][1], SHAPES[name][2]) for name in clip["shapes"]]
+        subs = clip_subtitles(clip, segments, out_dir.parent / "字幕", src, cfg)
+        targets = [(name,) + SHAPES[name] for name in clip["shapes"]]
         # 元の映像と形が違うときだけ、どこを切り出すか決める必要がある
-        needs_crop = any(tw * meta["height"] != th * meta["width"] for _, tw, th in targets)
+        needs_crop = any(tw * meta["height"] != th * meta["width"] for _, _, tw, th in targets)
         subject = None
         if needs_crop and clip["pos"] is None:
             subject = find_subject(src, meta, clip["start"], length)
@@ -542,19 +603,30 @@ def export_clips(src: Path, meta: dict, clips: list, out_dir: Path, cfg: dict) -
                 print("  人物の位置: {}を見つけました（左から {:.0f}%）".format(subject[2], subject[0] * 100))
             else:
                 print("  人物の位置: 見つからなかったので、中央で切り出します")
-        for label, tw, th in targets:
+        for shape, label, tw, th in targets:
             cw, ch, x, y = crop_box(meta, tw, th, subject, clip["pos"])
             vf = (["fps={}/{}".format(fps.numerator, fps.denominator)] + hdr
-                  + ["crop={}:{}:{}:{}".format(cw, ch, x, y), "scale={}:{}".format(tw, th),
-                     "setsar=1", "format=yuv420p"])
-            graph = "[0:{}]{}[v];[0:{}]aresample=48000[a]".format(
-                meta["video_index"], ",".join(vf), meta["audio_index"])
+                  + ["crop={}:{}:{}:{}".format(cw, ch, x, y), "scale={}:{}".format(tw, th), "setsar=1"])
             dst = out_dir / "{}_{:02d}_{}_{}.mp4".format(src.stem, clip["no"], safe_name(clip["title"]), label)
             print("  {}（{}x{}）".format(label, tw, th))
-            autocut.run_encode(["-ss", "{:.3f}".format(clip["start"]), "-t", "{:.3f}".format(length), "-i", str(src)],
-                               graph, dst, length, cfg["encode"], color_args)
-            made.append(dst)
-    return made
+            inputs = ["-ss", "{:.3f}".format(clip["start"]), "-t", "{:.3f}".format(length), "-i", str(src)]
+            title_secs = float(cfg["title"]["seconds"]) if cfg["title"]["enabled"] else 0
+            with tempfile.TemporaryDirectory() as work:
+                if (clip["title"] and title_secs > 0) or subs:
+                    t_style, s_style = telop.styles(cfg, tw, th, shape)
+                    lst = telop.build_overlay(Path(work), tw, th, length, clip["title"], title_secs,
+                                              subs, t_style, s_style)
+                    inputs += ["-f", "concat", "-safe", "0", "-i", str(lst)]
+                    graph = ("[0:{}]{}[base];[1:v]format=rgba[txt];"
+                             "[base][txt]overlay=0:0:eof_action=repeat,format=yuv420p[v];"
+                             "[0:{}]aresample=48000[a]").format(meta["video_index"], ",".join(vf), meta["audio_index"])
+                else:
+                    graph = "[0:{}]{},format=yuv420p[v];[0:{}]aresample=48000[a]".format(
+                        meta["video_index"], ",".join(vf), meta["audio_index"])
+                autocut.run_encode(inputs, graph, dst, length, cfg["encode"], color_args)
+            made.setdefault(clip["no"], []).append(dst)
+    write_post_text(out_dir / "{}_投稿用テキスト.txt".format(src.stem), src, clips, made)
+    return [f for files in made.values() for f in files]
 
 
 def backup(path: Path) -> Path:
@@ -575,6 +647,7 @@ def main(argv=None) -> int:
     p.add_argument("--export", nargs="*", metavar="形",
                    help="一覧で「はい」の候補を書き出す。形は tate（縦 9:16）/ yoko（横 16:9）/ square（1:1）/ feed（4:5）。"
                         "複数並べると全部作る。省略すると config.toml の shape")
+    p.add_argument("--no-subs", action="store_true", help="（--export のとき）字幕を入れない")
     p.add_argument("--list", type=Path, help="（--export のとき）別の場所に保存した候補の一覧（CSV）を使う")
     p.add_argument("--redo", action="store_true", help="（API を使う場合）候補の一覧がすでにあっても、AIに選び直してもらう")
     args = p.parse_args(argv)
@@ -584,6 +657,7 @@ def main(argv=None) -> int:
         raise AutocutError("動画ファイルが見つかりません: {}".format(src))
     cfg = autocut.load_config(args.config)
     if args.export is not None:
+        ensure_module("PIL")  # 文字を描く部品
         ensure_module("cv2", required=False)  # 人物の位置を探す部品。無ければ中央で切り出す
         shapes = parse_shapes(" ".join(args.export)) or parse_shapes(cfg["clips"]["shape"]) or ["tate"]
         out_dir = src.parent / (src.stem + "_clips")
@@ -595,8 +669,15 @@ def main(argv=None) -> int:
             raise AutocutError("一覧に「使う」が「はい」の候補がありません: {}".format(csv_path))
         print("  {} 本を書き出します（一覧: {}）".format(len(clips), csv_path.name))
         out_dir.mkdir(exist_ok=True)
-        made = export_clips(src, meta, clips, out_dir / "書き出し", cfg)
+        transcript_json = out_dir / (src.stem + "_transcript.json")
+        segments = None
+        if transcript_json.exists() and not args.no_subs:
+            segments = json.loads(transcript_json.read_text(encoding="utf-8"))
+        made = export_clips(src, meta, clips, out_dir / "書き出し", cfg, segments)
         print("✔ {} 本の動画ができました: {}".format(len(made), out_dir / "書き出し"))
+        print("  投稿用テキスト: {}_投稿用テキスト.txt（同じフォルダ）".format(src.stem))
+        if segments:
+            print("  字幕ファイル  : {}".format(out_dir / "字幕"))
         return 0
 
     use_api = has_api_credentials() and not args.paste
