@@ -194,6 +194,22 @@ def transcribe(src: Path, meta: dict, cfg: dict) -> list:
     return segments
 
 
+# 音楽や無音のところで、Whisper が実際には言っていない言葉を出してしまうことがある
+HALLUCINATIONS = ("大きな音楽", "おやすみなさい", "ご視聴ありがとうございました", "音楽", "拍手", "笑")
+
+
+def warn_if_little_speech(segments: list, duration: float) -> None:
+    """喋りがほとんど聞き取れなかったときに知らせる"""
+    real = [s for s in segments if s["text"].strip(" 。、.!?！？()（）[]「」") not in HALLUCINATIONS]
+    chars = sum(len(s["text"]) for s in real)
+    per_minute = chars / max(duration / 60, 0.5)
+    if per_minute < 60:
+        print("  ⚠ この動画からは、喋っている言葉がほとんど聞き取れませんでした（1分あたり約{:.0f}文字）。".format(per_minute))
+        print("    音楽やダンスが中心の動画は、あとの段階（見せ場探し）で対応します。今は喋りの動画で試してください。")
+    if duration < 60:
+        print("  ⚠ 動画が短いため（{:.0f}秒）、切り抜き候補はほとんど出ません。5分以上の動画がおすすめです。".format(duration))
+
+
 def fmt_clock(t: float) -> str:
     """12:34.5 または 1:02:34.5 の形にする"""
     t = round(t, 1)
@@ -613,6 +629,7 @@ def main(argv=None) -> int:
         transcript_txt.write_text(
             "\n".join("[{}] {}".format(fmt_clock(s["start"]), s["text"]) for s in segments) + "\n",
             encoding="utf-8")
+    warn_if_little_speech(segments, meta["duration"])
 
     if args.paste:
         clips = clips_from_answer(read_pasted_answer(), segments, meta["duration"])
