@@ -22,6 +22,7 @@ import json
 import os
 import platform
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -126,7 +127,7 @@ def ensure_module(name: str, required: bool = True) -> bool:
     if required:
         raise AutocutError(
             "切り抜き機能の準備がまだです。ターミナルで次を実行してください"
-            "（setup.sh はドラッグ＆ドロップできます）:\n    bash " + str(HERE / "setup.sh"))
+            "（setup.sh はドラッグ＆ドロップできます）:\n    bash " + shlex.quote(str(HERE / "setup.sh")))
     return False
 
 
@@ -176,7 +177,7 @@ def transcribe(src: Path, meta: dict, cfg: dict) -> list:
     """[{id, start, end, text}, ...] を返す（時間は秒）"""
     exe = shutil.which("whisper-cli") or shutil.which("whisper-cpp")
     if not exe:
-        raise AutocutError("文字起こしツール（whisper-cpp）が見つかりません。次を実行してください:\n    bash " + str(HERE / "setup.sh"))
+        raise AutocutError("文字起こしツール（whisper-cpp）が見つかりません。次を実行してください:\n    bash " + shlex.quote(str(HERE / "setup.sh")))
     model = whisper_model_path(str(cfg["model"]))
     with tempfile.TemporaryDirectory() as tmp:
         wav = Path(tmp) / "audio.wav"
