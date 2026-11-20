@@ -157,6 +157,9 @@ def whisper_model_path(name: str) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     # 前の版のツールのフォルダにダウンロード済みなら、それを移して使う（1.6GBを再ダウンロードしない）
     old = [HERE / "models" / filename] + sorted(HERE.parent.glob("kairikomiya*/models/" + filename))
+    for place in (Path.home() / "Downloads", Path.home() / "Desktop"):
+        old += sorted(place.glob("kairikomiya*/models/" + filename))
+        old += sorted(place.glob("*/kairikomiya*/models/" + filename))
     for o in old:
         if o.exists():
             shutil.move(str(o), str(path))
@@ -220,7 +223,7 @@ def warn_if_little_speech(segments: list, duration: float) -> None:
     per_minute = chars / max(duration / 60, 0.5)
     if per_minute < 60:
         print("  ⚠ この動画からは、喋っている言葉がほとんど聞き取れませんでした（1分あたり約{:.0f}文字）。".format(per_minute))
-        print("    音楽やダンスが中心の動画は、あとの段階（見せ場探し）で対応します。今は喋りの動画で試してください。")
+        print("    音楽やダンスが中心の動画は、コマンドの最後に  --dance  を足すと、音と動きから見せ場を探せます。")
     if duration < 60:
         print("  ⚠ 動画が短いため（{:.0f}秒）、切り抜き候補はほとんど出ません。5分以上の動画がおすすめです。".format(duration))
 
@@ -474,19 +477,21 @@ def read_candidates_csv(path: Path, duration: float, default_shapes: list) -> li
 
 
 def find_subject(src: Path, meta: dict, start: float, length: float):
-    """クリップの中の人物の位置を探す。(横位置, 縦位置, 説明) を 0〜1 で返す。見つからなければ None"""
+    """クリップの中の人物の位置を探す。
+    {"x", "y"（0〜1 の中央値）, "kind"（説明）, "track"（[(秒, 横位置), ...]）} を返す。見つからなければ None"""
     try:
         import cv2
         import numpy as np
     except ImportError:
         return None
+    rate = 1.5
     scale = 640.0 / max(meta["width"], meta["height"])
     w, h = int(meta["width"] * scale) // 2 * 2, int(meta["height"] * scale) // 2 * 2
-    # 1秒に1コマだけ、小さい白黒画像で取り出して調べる
+    # 1秒に1.5コマだけ、小さい白黒画像で取り出して調べる
     r = subprocess.run(
         ["ffmpeg", "-v", "error", "-ss", "{:.3f}".format(start), "-t", "{:.3f}".format(length),
          "-i", str(src), "-map", "0:{}".format(meta["video_index"]),
-         "-vf", "fps=1,scale={}:{}".format(w, h), "-f", "rawvideo", "-pix_fmt", "gray", "-"],
+         "-vf", "fps={},scale={}:{}".format(rate, w, h), "-f", "rawvideo", "-pix_fmt", "gray", "-"],
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     count = len(r.stdout) // (w * h)
     if r.returncode != 0 or count == 0:
@@ -494,28 +499,69 @@ def find_subject(src: Path, meta: dict, start: float, length: float):
     frames = np.frombuffer(r.stdout[:count * w * h], dtype=np.uint8).reshape(count, h, w)
     enough = max(2, count // 5)  # 全体の2割以上のコマで見つかったら採用
 
+    def result(points, kind):
+        xs = [p[0] for p in points if p is not None]
+        ys = [p[1] for p in points if p is not None]
+        track = [(i / rate, p[0]) for i, p in enumerate(points) if p is not None]
+        return {"x": float(np.median(xs)), "y": float(np.median(ys)), "kind": kind, "track": track}
+
     face = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
     small = max(24, min(w, h) // 12)
-    found = []
+    points = []
     for frame in frames:
         boxes = face.detectMultiScale(frame, scaleFactor=1.1, minNeighbors=6, minSize=(small, small))
         if len(boxes):
             x, y, bw, bh = max(boxes, key=lambda b: b[2] * b[3])  # いちばん大きい顔
-            found.append(((x + bw / 2) / w, (y + bh / 2) / h))
-    kind = "顔"
-    if len(found) < enough:  # 顔が小さい・写っていないときは、全身を探す
-        hog = cv2.HOGDescriptor()
-        hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
-        found = []
-        for frame in frames:
-            boxes, weights = hog.detectMultiScale(frame, winStride=(8, 8), scale=1.05)
-            if len(boxes) and float(max(weights)) > 0.5:
-                x, y, bw, bh = boxes[int(np.argmax(weights))]
-                found.append(((x + bw / 2) / w, (y + bh * 0.3) / h))  # 上半身あたりを中心に
-        kind = "全身"
-    if len(found) < enough:
+            points.append(((x + bw / 2) / w, (y + bh / 2) / h))
+        else:
+            points.append(None)
+    if sum(p is not None for p in points) >= enough:
+        return result(points, "顔")
+    # 顔が小さい・写っていないときは、全身を探す
+    hog = cv2.HOGDescriptor()
+    hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+    points = []
+    for frame in frames:
+        boxes, weights = hog.detectMultiScale(frame, winStride=(8, 8), scale=1.05)
+        if len(boxes) and float(max(weights)) > 0.5:
+            x, y, bw, bh = boxes[int(np.argmax(weights))]
+            points.append(((x + bw / 2) / w, (y + bh * 0.3) / h))  # 上半身あたりを中心に
+        else:
+            points.append(None)
+    if sum(p is not None for p in points) >= enough:
+        return result(points, "全身")
+    # 人が見つからないときは、映像の中でいちばん動いている場所を中心にする（ダンス向け）
+    if count >= 3:
+        diff = np.abs(frames[1:].astype(np.int16) - frames[:-1].astype(np.int16)).astype(np.float32)
+        points = [None]
+        for d in diff:
+            cols, rows = d.sum(axis=0), d.sum(axis=1)
+            if cols.sum() > d.size * 2:  # ほとんど動きがないコマは使わない
+                points.append((float((cols * np.arange(w)).sum() / cols.sum()) / max(1, w - 1),
+                               float((rows * np.arange(h)).sum() / rows.sum()) / max(1, h - 1)))
+            else:
+                points.append(None)
+        if sum(p is not None for p in points) >= enough:
+            return result(points, "動いている場所")
+    return None
+
+
+def follow_path(track: list, length: float, width_frac: float):
+    """人物の横位置の動きを、なめらかなカメラの動き [(秒, 横位置), ...] にする。
+    ほとんど動かないときは None（固定で切り出す）"""
+    import numpy as np
+    if len(track) < 3:
         return None
-    return float(np.median([p[0] for p in found])), float(np.median([p[1] for p in found])), kind
+    t = np.array([p[0] for p in track], dtype=np.float32)
+    x = np.array([p[1] for p in track], dtype=np.float32)
+    if np.percentile(x, 90) - np.percentile(x, 10) < width_frac * 0.35:
+        return None  # 切り出す幅に十分収まっている
+    grid = np.arange(0, length + 0.1, 0.1, dtype=np.float32)
+    xs = np.interp(grid, t, x)
+    k = 25  # 2.5秒でならして、カメラがゆっくり動くようにする
+    pad = np.concatenate([np.full(k, xs[0]), xs, np.full(k, xs[-1])])
+    xs = np.convolve(pad, np.ones(2 * k + 1) / (2 * k + 1), mode="same")[k:-k]
+    return list(zip(grid.tolist(), xs.tolist()))
 
 
 def crop_box(meta: dict, tw: int, th: int, subject, pos):
@@ -528,8 +574,8 @@ def crop_box(meta: dict, tw: int, th: int, subject, pos):
     if pos is not None:   # 一覧の「位置」で手動指定（0=左/上, 50=中央, 100=右/下）
         x, y = (W - cw) * pos / 100, (H - ch) * pos / 100
     elif subject:
-        x = subject[0] * W - cw / 2
-        y = subject[1] * H - ch * 0.4   # 上下を切るときは、人物を少し上寄りに置く
+        x = subject["x"] * W - cw / 2
+        y = subject["y"] * H - ch * 0.4   # 上下を切るときは、人物を少し上寄りに置く
     else:
         x, y = (W - cw) / 2, (H - ch) / 2
     return cw, ch, int(min(max(x, 0), W - cw)), int(min(max(y, 0), H - ch))
@@ -537,7 +583,7 @@ def crop_box(meta: dict, tw: int, th: int, subject, pos):
 
 def safe_name(title: str) -> str:
     name = re.sub(r'[\\/:*?"<>|\r\n\t]', "", title).strip(" .")
-    return name[:30] or "clip"
+    return name[:30] or "見せ場"
 
 
 def clip_subtitles(clip: dict, segments, sub_dir: Path, src: Path, cfg: dict):
@@ -582,6 +628,17 @@ def write_post_text(path: Path, src: Path, clips: list, made: dict) -> None:
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def write_follow_cmds(work_dir: Path, shape: str, follow: list, W: int, cw: int) -> str:
+    """切り出し位置を少しずつ動かすための ffmpeg 用の指示ファイルを作る"""
+    path = work_dir / "follow_{}.txt".format(shape)
+    lines = []
+    for t, cx in follow:
+        x = int(min(max(cx * W - cw / 2, 0), W - cw))
+        lines.append("{:.2f} crop@follow x {};".format(t, x))
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return str(path).replace("\\", "/").replace("'", "")
+
+
 def export_clips(src: Path, meta: dict, clips: list, out_dir: Path, cfg: dict, segments=None) -> list:
     import tempfile
     import telop
@@ -601,13 +658,23 @@ def export_clips(src: Path, meta: dict, clips: list, out_dir: Path, cfg: dict, s
         if needs_crop and clip["pos"] is None:
             subject = find_subject(src, meta, clip["start"], length)
             if subject:
-                print("  人物の位置: {}を見つけました（左から {:.0f}%）".format(subject[2], subject[0] * 100))
+                print("  人物の位置: {}を見つけました（左から {:.0f}%）".format(subject["kind"], subject["x"] * 100))
             else:
                 print("  人物の位置: 見つからなかったので、中央で切り出します")
+        work_root = tempfile.TemporaryDirectory()
+        work_dir = Path(work_root.name)
         for shape, label, tw, th in targets:
             cw, ch, x, y = crop_box(meta, tw, th, subject, clip["pos"])
+            follow = None
+            if subject and cw < meta["width"] and cfg["crop"]["follow"]:
+                follow = follow_path(subject["track"], length, cw / meta["width"])
+            crop_filters = ["crop={}:{}:{}:{}".format(cw, ch, x, y)]
+            if follow:
+                print("  人物が左右に動くので、カメラを追いかけるように切り出します")
+                crop_filters = ["sendcmd=f='{}'".format(write_follow_cmds(work_dir, shape, follow, meta["width"], cw)),
+                                "crop@follow={}:{}:{}:{}".format(cw, ch, x, y)]
             vf = (["fps={}/{}".format(fps.numerator, fps.denominator)] + hdr
-                  + ["crop={}:{}:{}:{}".format(cw, ch, x, y), "scale={}:{}".format(tw, th), "setsar=1"])
+                  + crop_filters + ["scale={}:{}".format(tw, th), "setsar=1"])
             dst = out_dir / "{}_{:02d}_{}_{}.mp4".format(src.stem, clip["no"], safe_name(clip["title"]), label)
             print("  {}（{}x{}）".format(label, tw, th))
             inputs = ["-ss", "{:.3f}".format(clip["start"]), "-t", "{:.3f}".format(length), "-i", str(src)]
@@ -626,6 +693,7 @@ def export_clips(src: Path, meta: dict, clips: list, out_dir: Path, cfg: dict, s
                         meta["video_index"], ",".join(vf), meta["audio_index"])
                 autocut.run_encode(inputs, graph, dst, length, cfg["encode"], color_args)
             made.setdefault(clip["no"], []).append(dst)
+        work_root.cleanup()
     write_post_text(out_dir / "{}_投稿用テキスト.txt".format(src.stem), src, clips, made)
     return [f for files in made.values() for f in files]
 
@@ -645,6 +713,8 @@ def main(argv=None) -> int:
     p.add_argument("video", type=Path, help="元の動画ファイル（mp4 / mov）")
     p.add_argument("--config", type=Path, help="設定ファイル（省略すると clip.py と同じ場所の config.toml）")
     p.add_argument("--paste", action="store_true", help="Claude アプリからコピーした返事を読み込んで、一覧を作る")
+    p.add_argument("--dance", action="store_true",
+                   help="ダンス・ライブなど喋りのない動画で、音と動きから見せ場を探して一覧を作る（AI を使わないので無料）")
     p.add_argument("--export", nargs="*", metavar="形",
                    help="一覧で「はい」の候補を書き出す。形は tate（縦 9:16）/ yoko（横 16:9）/ square（1:1）/ feed（4:5）。"
                         "複数並べると全部作る。省略すると config.toml の shape")
@@ -680,6 +750,9 @@ def main(argv=None) -> int:
         if segments:
             print("  字幕ファイル  : {}".format(out_dir / "字幕"))
         return 0
+
+    if args.dance:
+        return find_dance_clips(src, cfg)
 
     use_api = has_api_credentials() and not args.paste
     if use_api:
@@ -743,6 +816,48 @@ def main(argv=None) -> int:
             i, fmt_clock(c["start"]), fmt_clock(c["end"]), length, c["title"], note))
     print("  一覧      : " + str(csv_path))
     print("  文字起こし: " + str(transcript_txt))
+    return 0
+
+
+def find_dance_clips(src: Path, cfg: dict) -> int:
+    import dance
+    import telop
+    ensure_module("numpy")
+    ensure_module("PIL")
+    out_dir = src.parent / (src.stem + "_clips")
+    out_dir.mkdir(exist_ok=True)
+    csv_path = out_dir / (src.stem + "_candidates.csv")
+    graph_path = out_dir / (src.stem + "_見せ場グラフ.png")
+    print("▶ 動画を調べています: " + src.name)
+    meta = autocut.probe(src)
+    print("  長さ {}".format(fmt_clock(meta["duration"])))
+    dc = cfg["dance"]
+    an = dance.analyze(src, meta, dc)
+    if an["scene_cuts"]:
+        print("  カメラの切り替えを {} か所見つけました（動きには数えません）".format(len(an["scene_cuts"])))
+    found = dance.pick(an, meta["duration"], dc, int(dc["count_min"]), int(dc["count_max"]),
+                       float(dc["length_min"]), float(dc["length_max"]))
+    if not found:
+        raise AutocutError("見せ場が見つかりませんでした。")
+    found.sort(key=lambda c: -c["score"])
+    clips = [{"start": c["start"], "end": c["end"], "title": "", "hook": "",
+              "summary": "", "reason": dance.describe(c["parts"]), "description": "", "hashtags": ""}
+             for c in found]
+    if csv_path.exists():
+        print("  前の一覧は {} として残しました".format(backup(csv_path).name))
+    write_candidates_csv(csv_path, clips)
+    try:
+        font = telop.find_font("", telop.MAC_FONTS_MEDIUM)
+    except AutocutError:
+        font = None
+    dance.draw_graph(graph_path, an, found, meta["duration"], font)
+    print("✔ 見せ場を {} 本見つけました（盛り上がっている順）".format(len(clips)))
+    for i, c in enumerate(clips, 1):
+        print("  {:2d}. {}〜{}（{:.0f}秒） {}".format(
+            i, fmt_clock(c["start"]), fmt_clock(c["end"]), c["end"] - c["start"], c["reason"]))
+    print("  一覧  : " + str(csv_path))
+    print("  グラフ: " + str(graph_path))
+    print("  タイトルを入れたいときは、一覧の「タイトル案」に書いてください（空ならタイトルなし）。")
     return 0
 
 
