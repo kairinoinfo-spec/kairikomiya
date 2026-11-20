@@ -835,7 +835,13 @@ def find_dance_clips(src: Path, cfg: dict) -> int:
     an = dance.analyze(src, meta, dc)
     if an["scene_cuts"]:
         print("  カメラの切り替えを {} か所見つけました（動きには数えません）".format(len(an["scene_cuts"])))
-    found = dance.pick(an, meta["duration"], dc, int(dc["count_min"]), int(dc["count_max"]),
+    # 短い動画で本数を出しすぎないように、動画の長さの半分までに収める
+    room = max(1, int(meta["duration"] * 0.5 / float(dc["length_min"])))
+    count_max = min(int(dc["count_max"]), room)
+    count_min = min(int(dc["count_min"]), count_max)
+    if count_max < int(dc["count_min"]):
+        print("  動画が短いので、見せ場は {} 本までにします".format(count_max))
+    found = dance.pick(an, meta["duration"], dc, count_min, count_max,
                        float(dc["length_min"]), float(dc["length_max"]))
     if not found:
         raise AutocutError("見せ場が見つかりませんでした。")

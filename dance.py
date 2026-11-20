@@ -206,11 +206,15 @@ def pick(an: dict, duration: float, cfg: dict, count_min: int, count_max: int,
 
 
 def describe(parts: dict) -> str:
-    names = {"loud": "音の大きさ", "beat": "ビートの強さ", "motion": "動きの大きさ"}
+    """選んだ理由を、分かりやすい言葉にする（動画全体の中で、どのくらい大きいか）"""
+    names = {"loud": "音", "beat": "ビート", "motion": "動き"}
+    def level(v):
+        return "とても大きい" if v >= 0.8 else "大きい" if v >= 0.6 else "ふつう" if v >= 0.4 else "小さめ"
     items = sorted(parts.items(), key=lambda kv: -kv[1])
-    text = "、".join("{} 上位{:.0f}%".format(names[k], max(1, (1 - v) * 100)) for k, v in items)
-    best = names[items[0][0]]
-    return "{}が特に目立つ場面（{}）".format(best, text)
+    text = "、".join("{}が{}".format(names[k], level(v)) for k, v in items)
+    if items[0][1] < 0.6:
+        return "動画全体の中では比較的盛り上がっている場面（{}）".format(text)
+    return "{}が特に目立つ場面（{}）".format(names[items[0][0]], text)
 
 
 # ------------------------------------------------------------
