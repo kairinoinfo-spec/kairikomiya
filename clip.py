@@ -34,12 +34,8 @@ from autocut import AutocutError
 
 HERE = Path(__file__).resolve().parent
 # ツールを新しくダウンロードし直しても消えないように、大きなものはここに置く
-if platform.system() == "Darwin":
-    APP_DIR = Path.home() / "Library" / "Application Support" / "kairikomiya"
-else:
-    APP_DIR = Path.home() / ".local" / "share" / "kairikomiya"
+from speech import APP_DIR  # noqa: E402
 VENVS = [APP_DIR / "venv", HERE / ".venv"]
-MODEL_URL = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-{}.bin"
 
 # 料金の目安を表示するための単価（100万トークンあたりのドル: 入力, 出力）
 PRICES = {
@@ -146,70 +142,10 @@ def has_api_credentials() -> bool:
 # ------------------------------------------------------------
 # 文字起こし（whisper.cpp）
 # ------------------------------------------------------------
-def whisper_model_path(name: str) -> Path:
-    if name == "auto":
-        # Apple Silicon なら高精度モデル、Intel Mac なら軽いモデル
-        name = "large-v3-turbo" if platform.machine() == "arm64" else "small"
-    filename = "ggml-{}.bin".format(name)
-    path = APP_DIR / "models" / filename
-    if path.exists():
-        return path
-    path.parent.mkdir(parents=True, exist_ok=True)
-    # 前の版のツールのフォルダにダウンロード済みなら、それを移して使う（1.6GBを再ダウンロードしない）
-    old = [HERE / "models" / filename] + sorted(HERE.parent.glob("kairikomiya*/models/" + filename))
-    for place in (Path.home() / "Downloads", Path.home() / "Desktop"):
-        old += sorted(place.glob("kairikomiya*/models/" + filename))
-        old += sorted(place.glob("*/kairikomiya*/models/" + filename))
-    for o in old:
-        if o.exists():
-            shutil.move(str(o), str(path))
-            print("▶ 前にダウンロードした文字起こし用のモデルを使います")
-            return path
-    print("▶ 文字起こし用のモデル（{}）をダウンロードします。最初の1回だけです".format(name))
-    part = path.with_name(path.name + ".part")
-    r = subprocess.run(["curl", "-L", "--fail", "-#", "-o", str(part), MODEL_URL.format(name)])
-    if r.returncode != 0:
-        if part.exists():
-            part.unlink()
-        raise AutocutError("モデルのダウンロードに失敗しました。ネット接続と、config.toml の [transcribe] model の名前を確認してください。")
-    part.replace(path)
-    return path
-
-
 def transcribe(src: Path, meta: dict, cfg: dict) -> list:
     """[{id, start, end, text}, ...] を返す（時間は秒）"""
-    exe = shutil.which("whisper-cli") or shutil.which("whisper-cpp")
-    if not exe:
-        raise AutocutError("文字起こしツール（whisper-cpp）が見つかりません。次を実行してください:\n    bash " + shlex.quote(str(HERE / "setup.sh")))
-    model = whisper_model_path(str(cfg["model"]))
-    with tempfile.TemporaryDirectory() as tmp:
-        wav = Path(tmp) / "audio.wav"
-        r = autocut.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(src),
-                         "-map", "0:{}".format(meta["audio_index"]),
-                         "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", str(wav)])
-        if r.returncode != 0:
-            raise AutocutError("音声の取り出しに失敗しました:\n" + r.stderr[-1500:])
-        print("▶ 文字起こしをしています（動画の長さの 1/10〜同じくらいの時間がかかります）")
-        prefix = Path(tmp) / "out"
-        with tempfile.TemporaryFile(mode="w+", errors="replace") as errlog:
-            # 聞き取れた文章がそのまま画面に流れます
-            r = subprocess.run([exe, "-m", str(model), "-l", str(cfg["language"]),
-                                "-f", str(wav), "-oj", "-of", str(prefix)], stderr=errlog)
-            if r.returncode != 0:
-                errlog.seek(0)
-                raise AutocutError("文字起こしに失敗しました:\n" + errlog.read()[-1500:])
-        data = json.loads((Path(tmp) / "out.json").read_text(encoding="utf-8", errors="replace"))
-    segments = []
-    for item in data.get("transcription", []):
-        text = item.get("text", "").strip()
-        if not text:
-            continue
-        off = item["offsets"]
-        segments.append({"id": len(segments) + 1, "start": off["from"] / 1000.0,
-                         "end": off["to"] / 1000.0, "text": text})
-    if not segments:
-        raise AutocutError("言葉が聞き取れませんでした。喋りのない動画（ダンスなど）は、あとの段階で対応します。")
-    return segments
+    import speech
+    return speech.transcribe(src, meta, cfg)
 
 
 # 音楽や無音のところで、Whisper が実際には言っていない言葉を出してしまうことがある

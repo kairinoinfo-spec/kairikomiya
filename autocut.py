@@ -26,6 +26,11 @@ DEFAULTS = {
     "youtube": {"width": 1920, "height": 1080, "fps": "source"},
     "encode": {"encoder": "auto", "video_bitrate": "12M", "crf": 18, "audio_bitrate": "192k"},
     "transcribe": {"model": "auto", "language": "ja"},
+    "cut": {"words": True, "fillers_enabled": True, "repeats_enabled": True, "restarts_enabled": True,
+            "fillers": ["えー", "えーと", "えっと", "えーっと", "あー", "あのー", "あの", "そのー", "うーん", "んー", "まあ", "なんか"],
+            "prompt": "えー、あの、えっと、まあ、そのー、うーん、なんか。",
+            "speech_gaps": True, "speech_gap_min": 1.0, "speech_gap_pad_before": 0.25, "speech_gap_pad_after": 0.35,
+            "word_pad": 0.02},
     "clips": {"count_min": 5, "count_max": 15, "length_min": 30, "length_max": 60,
               "model": "claude-opus-5-5", "channel_info": "", "shape": "tate"},
     "crop": {"follow": True},
@@ -41,7 +46,7 @@ DEFAULTS = {
 MIN_CUT = 0.1
 
 YES, NO = "はい", "いいえ"
-CSV_COLUMNS = ["番号", "カットする", "開始", "終了", "長さ(秒)", "理由", "開始秒", "終了秒"]
+CSV_COLUMNS = ["番号", "カットする", "開始", "終了", "長さ(秒)", "理由", "内容", "開始秒", "終了秒"]
 
 
 class AutocutError(Exception):
@@ -67,7 +72,13 @@ def _parse_simple_toml(text: str) -> dict:
         if not m:
             raise AutocutError(f"設定ファイルの {lineno} 行目が読めません: {raw}")
         key, val = m.group(1), m.group(2).strip()
-        if val[0] in "\"'":
+        if val[0] == "[":
+            import json
+            try:
+                section[key] = json.loads(val)  # ["えー", "あの"] のような一覧
+            except ValueError:
+                raise AutocutError(f"設定ファイルの {lineno} 行目の一覧が読めません: {raw}")
+        elif val[0] in "\"'":
             section[key] = val[1:-1]
         elif val in ("true", "false"):
             section[key] = val == "true"
@@ -225,6 +236,58 @@ def build_cuts(silences, meta: dict, cfg: dict) -> list:
     return cuts
 
 
+def word_cuts(src: Path, meta: dict, cfg: dict, out_dir: Path, volume_cuts: list) -> list:
+    """文字起こしから、「えー」「あの」・繰り返し・言い直し・喋っていない間のカットを作る"""
+    import json
+    import speech
+    cc = cfg["cut"]
+    cache = out_dir / (src.stem + "_words.json")
+    if cache.exists():
+        segments = json.loads(cache.read_text(encoding="utf-8"))
+        print("▶ 前回の文字起こしを使います: " + cache.name)
+    else:
+        segments = speech.transcribe(src, meta, cfg["transcribe"], prompt=str(cc.get("prompt", "")), chars=True)
+        cache.write_text(json.dumps(segments, ensure_ascii=False), encoding="utf-8")
+        (out_dir / (src.stem + "_文字起こし.txt")).write_text(
+            "\n".join("[{}] {}".format(fmt_time(s["start"]), s["text"]) for s in segments) + "\n", encoding="utf-8")
+    fps, duration = meta["fps"], meta["duration"]
+
+    def snap(t):
+        return float(round(t * fps) / fps)
+
+    cuts = []
+    pad = float(cc["word_pad"])
+    for c in speech.find_word_cuts(segments, cc):
+        a, b = snap(max(0.0, c["start"] - pad)), snap(min(duration, c["end"] + pad))
+        if b - a >= MIN_CUT:
+            cuts.append({"start": a, "end": b, "reason": c["reason"], "text": c["text"], "enabled": True})
+    if cc["speech_gaps"]:
+        gap_cfg = {"min_silence": cc["speech_gap_min"], "pad_before": cc["speech_gap_pad_before"],
+                   "pad_after": cc["speech_gap_pad_after"]}
+        for g in build_cuts(speech.find_speech_gaps(segments, duration, gap_cfg), meta, gap_cfg):
+            # 音量で見つけた無音と重なるものは、そちらに任せる
+            if not any(v["start"] <= g["end"] and g["start"] <= v["end"] for v in volume_cuts):
+                g["reason"] = "声なし"
+                cuts.append(g)
+    return cuts
+
+
+def merge_cuts(cuts: list) -> list:
+    """重なったカットを1つにまとめる"""
+    merged = []
+    for c in sorted(cuts, key=lambda c: c["start"]):
+        if merged and c["start"] <= merged[-1]["end"] + 0.05:
+            m = merged[-1]
+            m["end"] = max(m["end"], c["end"])
+            if c["reason"] not in m["reason"].split("・"):
+                m["reason"] += "・" + c["reason"]
+            if c.get("text"):
+                m["text"] = (m.get("text", "") + " " + c["text"]).strip()
+        else:
+            merged.append(dict(c))
+    return merged
+
+
 def fmt_time(t: float) -> str:
     m, s = divmod(t, 60)
     return "{:02d}:{:05.2f}".format(int(m), s)
@@ -237,7 +300,7 @@ def write_cuts_csv(path: Path, cuts: list) -> None:
         w.writerow(CSV_COLUMNS)
         for i, c in enumerate(cuts, 1):
             w.writerow([i, YES if c["enabled"] else NO, fmt_time(c["start"]), fmt_time(c["end"]),
-                        "{:.2f}".format(c["end"] - c["start"]), c["reason"],
+                        "{:.2f}".format(c["end"] - c["start"]), c["reason"], c.get("text", ""),
                         "{:.3f}".format(c["start"]), "{:.3f}".format(c["end"])])
 
 
@@ -253,7 +316,8 @@ def read_cuts_csv(path: Path) -> list:
                 raise AutocutError(f"カット一覧の {n} 行目が読めません（「開始秒」「終了秒」の列は消さないでください）")
             flag = (row.get("カットする") or "").strip().lower()
             enabled = flag not in (NO, "no", "n", "0", "false", "×", "x", "")
-            cuts.append({"start": start, "end": end, "reason": row.get("理由", ""), "enabled": enabled})
+            cuts.append({"start": start, "end": end, "reason": row.get("理由", ""),
+                         "text": row.get("内容", "") or "", "enabled": enabled})
     return sorted(cuts, key=lambda c: c["start"])
 
 
@@ -361,11 +425,12 @@ def render(src: Path, dst: Path, keeps: list, meta: dict, out_cfg: dict, enc_cfg
 # メイン
 # ------------------------------------------------------------
 def main(argv=None) -> int:
-    p = argparse.ArgumentParser(description="動画の無音部分を自動でカットして、YouTube用（16:9）に書き出します。")
+    p = argparse.ArgumentParser(description="動画の無音・「えー」「あの」・言い直しを自動でカットして、YouTube用（16:9）に書き出します。")
     p.add_argument("video", type=Path, help="元の動画ファイル（mp4 / mov）")
     p.add_argument("--config", type=Path, help="設定ファイル（省略すると autocut.py と同じ場所の config.toml）")
     p.add_argument("--cuts", type=Path, help="手で直したカット一覧（CSV）を使って書き出し直す")
     p.add_argument("--list-only", action="store_true", help="動画は書き出さず、カット一覧だけ作る（設定の調整用）")
+    p.add_argument("--quick", action="store_true", help="文字起こしをせず、音量による無音カットだけにする（速い）")
     args = p.parse_args(argv)
 
     src = args.video.expanduser()
@@ -394,6 +459,27 @@ def main(argv=None) -> int:
             print("  この動画の音量: 平均 {:.0f} dB / 最大 {:.0f} dB（無音の基準: {} dB）".format(
                 mean, peak, cfg["silence"]["threshold_db"]))
         cuts = build_cuts(silences, meta, cfg["silence"])
+        for c in cuts:
+            c["text"] = ""
+        if cfg["cut"]["words"] and not args.quick:
+            import speech
+            if speech.whisper_exe():
+                extra = word_cuts(src, meta, cfg, out_dir, cuts)
+                counts = {}
+                for c in extra:
+                    counts[c["reason"]] = counts.get(c["reason"], 0) + 1
+                print("  文字起こしから見つけたカット: " + ("、".join(
+                    "{} {}か所".format(k, v) for k, v in counts.items()) or "なし"))
+                cuts = merge_cuts(cuts + extra)
+            else:
+                print("  ※ 文字起こしツールがないので、無音カットだけにします（setup.sh を実行すると、言い間違いもカットできます）")
+        if csv_path.exists():  # 手で直した一覧を消さないように、前の一覧は残す
+            n = 1
+            while csv_path.with_name("{}_old{}.csv".format(csv_path.stem, n)).exists():
+                n += 1
+            old = csv_path.with_name("{}_old{}.csv".format(csv_path.stem, n))
+            csv_path.rename(old)
+            print("  前のカット一覧は {} として残しました".format(old.name))
         write_cuts_csv(csv_path, cuts)
 
     keeps = keep_segments(cuts, meta["duration"])
