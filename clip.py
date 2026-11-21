@@ -509,7 +509,7 @@ def clip_subtitles(clip: dict, segments, sub_dir: Path, src: Path, cfg: dict):
     if not segments or not cfg["subtitle"]["enabled"]:
         return []
     sub_dir.mkdir(exist_ok=True)
-    srt = sub_dir / "{}_{:02d}.srt".format(src.stem, clip["no"])
+    srt = sub_dir / "{}_{:02d}.srt".format(autocut.base_stem(src, "_clips"), clip["no"])
     info = srt.with_suffix(".json")
     span = {"start": round(clip["start"], 2), "end": round(clip["end"], 2)}
     if srt.exists() and info.exists():
@@ -592,7 +592,7 @@ def export_clips(src: Path, meta: dict, clips: list, out_dir: Path, cfg: dict, s
                                 "crop@follow={}:{}:{}:{}".format(cw, ch, x, y)]
             vf = (["fps={}/{}".format(fps.numerator, fps.denominator)] + hdr
                   + crop_filters + ["scale={}:{}".format(tw, th), "setsar=1"])
-            dst = out_dir / "{}_{:02d}_{}_{}.mp4".format(src.stem, clip["no"], safe_name(clip["title"]), label)
+            dst = out_dir / "{}_{:02d}_{}_{}.mp4".format(autocut.base_stem(src, "_clips"), clip["no"], safe_name(clip["title"]), label)
             print("  {}（{}x{}）".format(label, tw, th))
             inputs = ["-ss", "{:.3f}".format(clip["start"]), "-t", "{:.3f}".format(length), "-i", str(src)]
             title_secs = float(cfg["title"]["seconds"]) if cfg["title"]["enabled"] else 0
@@ -611,7 +611,7 @@ def export_clips(src: Path, meta: dict, clips: list, out_dir: Path, cfg: dict, s
                 autocut.run_encode(inputs, graph, dst, length, cfg["encode"], color_args)
             made.setdefault(clip["no"], []).append(dst)
         work_root.cleanup()
-    write_post_text(out_dir / "{}_投稿用テキスト.txt".format(src.stem), src, clips, made)
+    write_post_text(out_dir / "{}_投稿用テキスト.txt".format(autocut.base_stem(src, "_clips")), src, clips, made)
     return [f for files in made.values() for f in files]
 
 
@@ -644,12 +644,14 @@ def main(argv=None) -> int:
     if not src.is_file():
         raise AutocutError("動画ファイルが見つかりません: {}".format(src))
     cfg = autocut.load_config(args.config)
+    if src.parent.name == "書き出し" or (src.stem.endswith("_youtube") and src.parent.name.endswith("_autocut")):
+        raise AutocutError("これは、このツールで書き出したあとの動画です。元の動画を読み込ませてください。")
     if args.export is not None:
         ensure_module("PIL")  # 文字を描く部品
         ensure_module("cv2", required=False)  # 人物の位置を探す部品。無ければ中央で切り出す
         shapes = parse_shapes(" ".join(args.export)) or parse_shapes(cfg["clips"]["shape"]) or ["tate"]
-        out_dir = src.parent / (src.stem + "_clips")
-        csv_path = args.list.expanduser() if args.list else out_dir / (src.stem + "_candidates.csv")
+        out_dir = src.parent / (autocut.base_stem(src, "_clips") + "_clips")
+        csv_path = args.list.expanduser() if args.list else out_dir / (autocut.base_stem(src, "_clips") + "_candidates.csv")
         print("▶ 動画を調べています: " + src.name)
         meta = autocut.probe(src)
         clips = read_candidates_csv(csv_path, meta["duration"], shapes)
@@ -657,13 +659,13 @@ def main(argv=None) -> int:
             raise AutocutError("一覧に「使う」が「はい」の候補がありません: {}".format(csv_path))
         print("  {} 本を書き出します（一覧: {}）".format(len(clips), csv_path.name))
         out_dir.mkdir(exist_ok=True)
-        transcript_json = out_dir / (src.stem + "_transcript.json")
+        transcript_json = out_dir / (autocut.base_stem(src, "_clips") + "_transcript.json")
         segments = None
         if transcript_json.exists() and not args.no_subs:
             segments = json.loads(transcript_json.read_text(encoding="utf-8"))
         made = export_clips(src, meta, clips, out_dir / "書き出し", cfg, segments)
         print("✔ {} 本の動画ができました: {}".format(len(made), out_dir / "書き出し"))
-        print("  投稿用テキスト: {}_投稿用テキスト.txt（同じフォルダ）".format(src.stem))
+        print("  投稿用テキスト: {}_投稿用テキスト.txt（同じフォルダ）".format(autocut.base_stem(src, "_clips")))
         if segments:
             print("  字幕ファイル  : {}".format(out_dir / "字幕"))
         return 0
@@ -675,12 +677,12 @@ def main(argv=None) -> int:
     if use_api:
         ensure_module("anthropic")
 
-    out_dir = src.parent / (src.stem + "_clips")
+    out_dir = src.parent / (autocut.base_stem(src, "_clips") + "_clips")
     out_dir.mkdir(exist_ok=True)
-    transcript_json = out_dir / (src.stem + "_transcript.json")
-    transcript_txt = out_dir / (src.stem + "_transcript.txt")
-    csv_path = out_dir / (src.stem + "_candidates.csv")
-    prompt_path = out_dir / (src.stem + "_prompt.txt")
+    transcript_json = out_dir / (autocut.base_stem(src, "_clips") + "_transcript.json")
+    transcript_txt = out_dir / (autocut.base_stem(src, "_clips") + "_transcript.txt")
+    csv_path = out_dir / (autocut.base_stem(src, "_clips") + "_candidates.csv")
+    prompt_path = out_dir / (autocut.base_stem(src, "_clips") + "_prompt.txt")
 
     if use_api and csv_path.exists() and not args.redo:
         raise AutocutError(
@@ -741,10 +743,10 @@ def find_dance_clips(src: Path, cfg: dict) -> int:
     import telop
     ensure_module("numpy")
     ensure_module("PIL")
-    out_dir = src.parent / (src.stem + "_clips")
+    out_dir = src.parent / (autocut.base_stem(src, "_clips") + "_clips")
     out_dir.mkdir(exist_ok=True)
-    csv_path = out_dir / (src.stem + "_candidates.csv")
-    graph_path = out_dir / (src.stem + "_見せ場グラフ.png")
+    csv_path = out_dir / (autocut.base_stem(src, "_clips") + "_candidates.csv")
+    graph_path = out_dir / (autocut.base_stem(src, "_clips") + "_見せ場グラフ.png")
     print("▶ 動画を調べています: " + src.name)
     meta = autocut.probe(src)
     print("  長さ {}".format(fmt_clock(meta["duration"])))

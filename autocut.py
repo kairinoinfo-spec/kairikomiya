@@ -244,14 +244,14 @@ def word_cuts(src: Path, meta: dict, cfg: dict, out_dir: Path, volume_cuts: list
     import json
     import speech
     cc = cfg["cut"]
-    cache = out_dir / (src.stem + "_words.json")
+    cache = out_dir / (base_stem(src, "_autocut") + "_words.json")
     if cache.exists():
         segments = json.loads(cache.read_text(encoding="utf-8"))
         print("▶ 前回の文字起こしを使います: " + cache.name)
     else:
         segments = speech.transcribe(src, meta, cfg["transcribe"], prompt=str(cc.get("prompt", "")), chars=True)
         cache.write_text(json.dumps(segments, ensure_ascii=False), encoding="utf-8")
-        (out_dir / (src.stem + "_文字起こし.txt")).write_text(
+        (out_dir / (base_stem(src, "_autocut") + "_文字起こし.txt")).write_text(
             "\n".join("[{}] {}".format(fmt_time(s["start"]), s["text"]) for s in segments) + "\n", encoding="utf-8")
     fps, duration = meta["fps"], meta["duration"]
 
@@ -290,7 +290,7 @@ def make_subtitles(src: Path, out_dir: Path, cuts: list, keeps: list, cfg: dict,
         subs = telop.read_srt(srt)
         print("▶ 字幕ファイルを使います: {}（{}個）".format(srt.name, len(subs)))
         return subs, None
-    cache = out_dir / (src.stem + "_words.json")
+    cache = out_dir / (base_stem(src, "_autocut") + "_words.json")
     if not cache.exists():
         if not args.quick:
             print("  ※ 文字起こしがないので、字幕は入れません")
@@ -298,7 +298,7 @@ def make_subtitles(src: Path, out_dir: Path, cuts: list, keeps: list, cfg: dict,
     speech.ensure_module("PIL")  # 文字を描く部品
     segments = json.loads(cache.read_text(encoding="utf-8"))
     subs = telop.subtitles_after_cuts(segments, cuts, keeps, int(cfg["subtitle"]["max_chars"]))
-    srt_path = out_dir / (src.stem + "_字幕.srt")
+    srt_path = out_dir / (base_stem(src, "_autocut") + "_字幕.srt")
     if srt_path.exists():
         n = 1
         while srt_path.with_name("{}_old{}.srt".format(srt_path.stem, n)).exists():
@@ -323,6 +323,14 @@ def merge_cuts(cuts: list) -> list:
         else:
             merged.append(dict(c))
     return merged
+
+
+def base_stem(src: Path, suffix: str) -> str:
+    """作るフォルダやファイルの名前のもとにする、動画の名前。
+    長すぎると Mac で保存できないので短くする（前に長い名前で作ったフォルダがあれば、そのまま使う）"""
+    if len(src.stem) <= 40 or (src.parent / (src.stem + suffix)).exists():
+        return src.stem
+    return src.stem[:40].rstrip(" 　_-")
 
 
 def fmt_time(t: float) -> str:
@@ -487,10 +495,14 @@ def main(argv=None) -> int:
         import speech
         # 字幕の文字を描く部品が入った Python に、最初に切り替えておく（途中で切り替えると最初からやり直しになるため）
         speech.ensure_module("PIL", required=False)
-    out_dir = src.parent / (src.stem + "_autocut")
+    if src.stem.endswith("_youtube") and src.parent.name.endswith("_autocut"):
+        raise AutocutError("これは、このツールで書き出したあとの動画です。\n"
+                           "カットする前の、元の動画を読み込ませてください（_autocut フォルダの外にあります）。")
+    stem = base_stem(src, "_autocut")
+    out_dir = src.parent / (stem + "_autocut")
     out_dir.mkdir(exist_ok=True)
-    csv_path = out_dir / (src.stem + "_cuts.csv")
-    out_path = out_dir / (src.stem + "_youtube.mp4")
+    csv_path = out_dir / (stem + "_cuts.csv")
+    out_path = out_dir / (stem + "_youtube.mp4")
 
     print("▶ 動画を調べています: " + src.name)
     meta = probe(src)
