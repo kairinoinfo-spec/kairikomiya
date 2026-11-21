@@ -28,7 +28,7 @@ DEFAULTS = {
     "silence": {"threshold_db": -35, "min_silence": 0.6, "pad_before": 0.15, "pad_after": 0.25},
     "youtube": {"width": 1920, "height": 1080, "fps": "source", "burn_subtitles": True},
     "encode": {"encoder": "auto", "video_bitrate": "12M", "crf": 18, "audio_bitrate": "192k"},
-    "transcribe": {"model": "auto", "language": "ja"},
+    "transcribe": {"model": "auto", "language": "ja", "hints": []},
     "cut": {"words": True, "fillers_enabled": True, "repeats_enabled": True, "restarts_enabled": True,
             "fillers": ["えー", "えーと", "えっと", "えーっと", "あー", "あのー", "あの", "そのー", "うーん", "んー", "まあ", "なんか"],
             "prompt": "えー、あの、えっと、まあ、そのー、うーん、なんか。",
@@ -42,7 +42,8 @@ DEFAULTS = {
     "title": {"enabled": True, "seconds": 2.0, "size": 96, "color": "#FFE600", "outline": "#000000",
               "outline_width": 10, "band": "", "position_tate": 20, "position_yoko": 14, "font": ""},
     "subtitle": {"enabled": True, "size": 64, "color": "#FFFFFF", "outline": "#000000", "outline_width": 7,
-                 "band": "", "max_chars": 24, "position_tate": 72, "position_yoko": 88, "font": ""},
+                 "band": "", "max_chars": 24, "position_tate": 72, "position_yoko": 88, "font": "",
+                 "replace": []},
 }
 
 # これより短いカットは、つなぎ目が増えるだけなので行わない（秒）
@@ -249,7 +250,8 @@ def word_cuts(src: Path, meta: dict, cfg: dict, out_dir: Path, volume_cuts: list
         segments = json.loads(cache.read_text(encoding="utf-8"))
         print("▶ 前回の文字起こしを使います: " + cache.name)
     else:
-        segments = speech.transcribe(src, meta, cfg["transcribe"], prompt=str(cc.get("prompt", "")), chars=True)
+        prompt = str(cc.get("prompt", "")) + speech.hint_text(cfg["transcribe"])
+        segments = speech.transcribe(src, meta, cfg["transcribe"], prompt=prompt, chars=True)
         cache.write_text(json.dumps(segments, ensure_ascii=False), encoding="utf-8")
         (out_dir / (base_stem(src, "_autocut") + "_文字起こし.txt")).write_text(
             "\n".join("[{}] {}".format(fmt_time(s["start"]), s["text"]) for s in segments) + "\n", encoding="utf-8")
@@ -297,7 +299,10 @@ def make_subtitles(src: Path, out_dir: Path, cuts: list, keeps: list, cfg: dict,
         return [], None
     speech.ensure_module("PIL")  # 文字を描く部品
     segments = json.loads(cache.read_text(encoding="utf-8"))
-    subs = telop.subtitles_after_cuts(segments, cuts, keeps, int(cfg["subtitle"]["max_chars"]))
+    meta = probe(src)
+    refine = speech.voice_refiner(src, meta)  # 喋り出す前の無音に字幕が出ないように
+    subs = telop.subtitles_after_cuts(segments, cuts, keeps, int(cfg["subtitle"]["max_chars"]),
+                                      refine=refine, replace=cfg["subtitle"].get("replace", []))
     srt_path = out_dir / (base_stem(src, "_autocut") + "_字幕.srt")
     if srt_path.exists():
         n = 1

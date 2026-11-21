@@ -175,7 +175,7 @@ def tidy(text: str) -> str:
     return t.strip(" 　")
 
 
-def subtitles_for_clip(segments: list, start: float, end: float, max_chars: int) -> list:
+def subtitles_for_clip(segments: list, start: float, end: float, max_chars: int, replace=None) -> list:
     """文字起こしから、クリップ内の時間（0秒始まり）の字幕 [(開始, 終了, 文字), ...] を作る"""
     subs = []
     for seg in segments:
@@ -183,7 +183,11 @@ def subtitles_for_clip(segments: list, start: float, end: float, max_chars: int)
             continue
         if seg["text"].strip(" 。、.!?！？()（）[]「」") in HALLUCINATIONS:
             continue
-        chunks = split_text(seg["text"], max_chars)
+        text = seg["text"]
+        if replace:
+            from speech import replace_text
+            text = replace_text(text, replace)
+        chunks = split_text(text, max_chars)
         total = sum(len(c) for c in chunks) or 1
         t = seg["start"]
         for c in chunks:  # 文字数に合わせて時間を分ける
@@ -397,10 +401,15 @@ def to_output_time(t: float, keeps: list) -> float:
     return out
 
 
-def subtitles_after_cuts(segments: list, cuts: list, keeps: list, max_chars: int) -> list:
+def subtitles_after_cuts(segments: list, cuts: list, keeps: list, max_chars: int,
+                         refine=None, replace=None) -> list:
     """1文字ごとの時間つきの文字起こしから、カットで消した言葉を除いた字幕
     [(開始, 終了, 文字), ...] を、カットしたあとの時間で作る"""
-    enabled = [(c["start"], c["end"]) for c in cuts if c["enabled"]]
+    # 字幕から言葉を消すのは、言葉を切ったカットだけ（無音・声なしのカットでは消さない。
+    # 文字起こしの時間が少しずれて、言葉の頭が無音のカットに入ってしまうことがあるため）
+    word_reasons = ("えー・あの", "繰り返し", "言い直し")
+    enabled = [(c["start"], c["end"]) for c in cuts
+               if c["enabled"] and any(r in str(c.get("reason", "")) for r in word_reasons)]
 
     def is_cut(ch):
         mid = (ch[1] + ch[2]) / 2
@@ -414,6 +423,9 @@ def subtitles_after_cuts(segments: list, cuts: list, keeps: list, max_chars: int
         if not chars:
             continue
         kept = [c for c in chars if not is_cut(c)]
+        if replace:
+            from speech import apply_replacements
+            kept = apply_replacements(kept, replace)
         # 消した言葉のあとに残った「、」で始まらないように整える
         while kept and kept[0][0] in "、，, 　":
             kept.pop(0)
@@ -427,8 +439,11 @@ def subtitles_after_cuts(segments: list, cuts: list, keeps: list, max_chars: int
                 continue
             j = i + len(chunk) - 1
             pos = j + 1
-            a = to_output_time(kept[i][1], keeps)
-            b = to_output_time(kept[j][2], keeps)
+            src_a, src_b = kept[i][1], kept[j][2]
+            if refine is not None:
+                src_a, src_b = refine(src_a, src_b)
+            a = to_output_time(src_a, keeps)
+            b = to_output_time(src_b, keeps)
             if b - a < 0.3:
                 b = a + 0.3  # 短すぎると読めないので、少しだけ長く出す
             subs.append([a, b, chunk])

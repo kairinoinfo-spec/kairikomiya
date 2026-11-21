@@ -126,7 +126,7 @@ def has_api_credentials() -> bool:
 def transcribe(src: Path, meta: dict, cfg: dict) -> list:
     """[{id, start, end, text}, ...] を返す（時間は秒）"""
     import speech
-    return speech.transcribe(src, meta, cfg)
+    return speech.transcribe(src, meta, cfg, prompt=speech.hint_text(cfg))
 
 
 # 音楽や無音のところで、Whisper が実際には言っていない言葉を出してしまうことがある
@@ -523,7 +523,8 @@ def clip_subtitles(clip: dict, segments, sub_dir: Path, src: Path, cfg: dict):
             return subs
         old = backup(srt)
         print("  字幕: 開始・終了が変わったので作り直します（前の字幕は {} に残しました）".format(old.name))
-    subs = telop.subtitles_for_clip(segments, clip["start"], clip["end"], int(cfg["subtitle"]["max_chars"]))
+    subs = telop.subtitles_for_clip(segments, clip["start"], clip["end"], int(cfg["subtitle"]["max_chars"]),
+                                    replace=cfg["subtitle"].get("replace", []))
     telop.write_srt(srt, subs)
     info.write_text(json.dumps(span), encoding="utf-8")
     print("  字幕: {}個 作りました（{}）".format(len(subs), srt.name))

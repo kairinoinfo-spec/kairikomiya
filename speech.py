@@ -92,6 +92,12 @@ def whisper_model_path(name: str) -> Path:
     return path
 
 
+def hint_text(cfg: dict) -> str:
+    """config.toml の hints（出てくる言葉）を、文字起こしの AI へのお願いの文にする"""
+    words = [str(w).strip() for w in cfg.get("hints", []) if str(w).strip()]
+    return ("この動画に出てくる言葉: " + "、".join(words) + "。") if words else ""
+
+
 def whisper_exe():
     return shutil.which("whisper-cli") or shutil.which("whisper-cpp")
 
@@ -302,3 +308,78 @@ def find_speech_gaps(segments: list, duration: float, cfg: dict) -> list:
     if duration - pos >= float(cfg["min_silence"]):
         gaps.append((pos, duration))
     return gaps
+
+
+# ------------------------------------------------------------
+# 声が実際に出ている時間で、字幕の出始め・終わりを合わせる
+# ------------------------------------------------------------
+def voice_refiner(src: Path, meta: dict):
+    """(開始, 終了) を受け取り、その間で実際に声が出ている部分に縮めて返す関数を作る。
+    文字起こしの時間は、喋り始める前の無音から始まっていることがあるため。使えなければ None"""
+    try:
+        import numpy as np
+    except ImportError:
+        return None
+    rate, step = 8000, 0.02
+    r = subprocess.run(["ffmpeg", "-v", "error", "-i", str(src), "-map", "0:{}".format(meta["audio_index"]),
+                        "-ac", "1", "-ar", str(rate), "-f", "s16le", "-"],
+                       stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    if r.returncode != 0 or not r.stdout:
+        return None
+    x = np.frombuffer(r.stdout, dtype=np.int16).astype(np.float32) / 32768.0
+    hop = int(rate * step)
+    n = len(x) // hop
+    if n < 10:
+        return None
+    db = 20 * np.log10(np.sqrt((x[:n * hop].reshape(n, hop) ** 2).mean(axis=1)) + 1e-6)
+    # 声とみなす大きさ: いちばん静かなあたり（雑音）より 12dB 大きい
+    level = max(float(np.percentile(db, 15)) + 12, -50.0)
+    loud = db >= level
+
+    def refine(a: float, b: float):
+        ia, ib = max(0, int(a / step)), min(n, int(b / step) + 1)
+        if ib <= ia:
+            return a, b
+        idx = np.nonzero(loud[ia:ib])[0]
+        if len(idx) == 0:
+            return a, b  # 声が見つからない（BGM などで分からない）ときはそのまま
+        first, last = (ia + idx[0]) * step, (ia + idx[-1] + 1) * step
+        a2 = max(a, first - 0.05)          # 声が出る少し前から
+        b2 = min(b, last + 0.25)           # 声が終わって少し後まで
+        if b2 - a2 < 0.3:
+            return a, b
+        return a2, b2
+
+    return refine
+
+
+def apply_replacements(chars: list, rules: list) -> list:
+    """「確率→国立」のような置き換えを、1文字ごとの時間を保ったまま行う"""
+    pairs = []
+    for rule in rules or []:
+        for sep in ("→", "->", "=>", "＝", "="):
+            if sep in str(rule):
+                old, new = str(rule).split(sep, 1)
+                if old.strip():
+                    pairs.append((old.strip(), new.strip()))
+                break
+    if not pairs:
+        return chars
+    for old, new in pairs:
+        text = "".join(c[0] for c in chars)
+        i = text.find(old)
+        while i >= 0:
+            span = chars[i:i + len(old)]
+            a, b = span[0][1], span[-1][2]
+            d = (b - a) / max(1, len(new))
+            repl = [[ch, a + d * k, a + d * (k + 1)] for k, ch in enumerate(new)]
+            chars = chars[:i] + repl + chars[i + len(old):]
+            text = "".join(c[0] for c in chars)
+            i = text.find(old, i + len(new))
+    return chars
+
+
+def replace_text(text: str, rules: list) -> str:
+    """apply_replacements の、時間のない文字列版"""
+    chars = apply_replacements([[ch, 0.0, 0.0] for ch in text], rules)
+    return "".join(c[0] for c in chars)
