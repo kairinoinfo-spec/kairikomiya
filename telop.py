@@ -380,3 +380,61 @@ def build_overlay(work: Path, w: int, h: int, length: float, title: str, title_s
     lines.append("file '{}'".format(entries[-1][0].name))  # 最後の画像は2回書く決まり
     lst.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return lst
+
+
+# ------------------------------------------------------------
+# 長い動画（autocut.py）の字幕: カットしたあとの時間に合わせる
+# ------------------------------------------------------------
+def to_output_time(t: float, keeps: list) -> float:
+    """元の動画の時間 t を、カットしたあとの動画の時間に直す（カットされた部分なら、その直後）"""
+    out = 0.0
+    for a, b in keeps:
+        if t < a:
+            return out
+        if t <= b:
+            return out + (t - a)
+        out += b - a
+    return out
+
+
+def subtitles_after_cuts(segments: list, cuts: list, keeps: list, max_chars: int) -> list:
+    """1文字ごとの時間つきの文字起こしから、カットで消した言葉を除いた字幕
+    [(開始, 終了, 文字), ...] を、カットしたあとの時間で作る"""
+    enabled = [(c["start"], c["end"]) for c in cuts if c["enabled"]]
+
+    def is_cut(ch):
+        mid = (ch[1] + ch[2]) / 2
+        return any(a <= mid < b for a, b in enabled)
+
+    subs = []
+    for seg in segments:
+        if seg["text"].strip(" 。、.!?！？()（）[]「」") in HALLUCINATIONS:
+            continue
+        chars = seg.get("chars") or []
+        if not chars:
+            continue
+        kept = [c for c in chars if not is_cut(c)]
+        # 消した言葉のあとに残った「、」で始まらないように整える
+        while kept and kept[0][0] in "、，, 　":
+            kept.pop(0)
+        if not kept:
+            continue
+        text = "".join(c[0] for c in kept)
+        pos = 0
+        for chunk in split_text(text, max_chars):
+            i = text.find(chunk, pos)
+            if i < 0:
+                continue
+            j = i + len(chunk) - 1
+            pos = j + 1
+            a = to_output_time(kept[i][1], keeps)
+            b = to_output_time(kept[j][2], keeps)
+            if b - a < 0.3:
+                b = a + 0.3  # 短すぎると読めないので、少しだけ長く出す
+            subs.append([a, b, chunk])
+    subs.sort(key=lambda s: s[0])
+    for cur, nxt in zip(subs, subs[1:]):
+        if 0 < nxt[0] - cur[1] < 0.4:
+            cur[1] = nxt[0]  # 次の字幕との間がほんの少しだけ空くときは、つなげてちらつきを防ぐ
+        cur[1] = min(cur[1], nxt[0])
+    return [tuple(s) for s in subs if s[1] - s[0] > 0.05]

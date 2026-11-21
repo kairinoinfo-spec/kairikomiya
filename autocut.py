@@ -20,10 +20,13 @@ from fractions import Fraction
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+if __name__ == "__main__":
+    # ほかの部品が「import autocut」したときに、同じものを使うようにする（エラーの表示をそろえるため）
+    sys.modules["autocut"] = sys.modules[__name__]
 
 DEFAULTS = {
     "silence": {"threshold_db": -35, "min_silence": 0.6, "pad_before": 0.15, "pad_after": 0.25},
-    "youtube": {"width": 1920, "height": 1080, "fps": "source"},
+    "youtube": {"width": 1920, "height": 1080, "fps": "source", "burn_subtitles": True},
     "encode": {"encoder": "auto", "video_bitrate": "12M", "crf": 18, "audio_bitrate": "192k"},
     "transcribe": {"model": "auto", "language": "ja"},
     "cut": {"words": True, "fillers_enabled": True, "repeats_enabled": True, "restarts_enabled": True,
@@ -272,6 +275,40 @@ def word_cuts(src: Path, meta: dict, cfg: dict, out_dir: Path, volume_cuts: list
     return cuts
 
 
+def make_subtitles(src: Path, out_dir: Path, cuts: list, keeps: list, cfg: dict, args):
+    """字幕 [(開始, 終了, 文字), ...] と、書き出した .srt の場所を返す。字幕を入れないときは ([], None)"""
+    import json
+    if args.no_subs or not cfg["subtitle"]["enabled"]:
+        return [], None
+    import speech
+    import telop
+    if args.srt:
+        srt = args.srt.expanduser()
+        if not srt.exists():
+            raise AutocutError("字幕ファイルが見つかりません: {}".format(srt))
+        speech.ensure_module("PIL")
+        subs = telop.read_srt(srt)
+        print("▶ 字幕ファイルを使います: {}（{}個）".format(srt.name, len(subs)))
+        return subs, None
+    cache = out_dir / (src.stem + "_words.json")
+    if not cache.exists():
+        if not args.quick:
+            print("  ※ 文字起こしがないので、字幕は入れません")
+        return [], None
+    speech.ensure_module("PIL")  # 文字を描く部品
+    segments = json.loads(cache.read_text(encoding="utf-8"))
+    subs = telop.subtitles_after_cuts(segments, cuts, keeps, int(cfg["subtitle"]["max_chars"]))
+    srt_path = out_dir / (src.stem + "_字幕.srt")
+    if srt_path.exists():
+        n = 1
+        while srt_path.with_name("{}_old{}.srt".format(srt_path.stem, n)).exists():
+            n += 1
+        srt_path.rename(srt_path.with_name("{}_old{}.srt".format(srt_path.stem, n)))
+    telop.write_srt(srt_path, subs)
+    print("▶ 字幕を {} 個作りました（カットしたあとの時間に合わせています）".format(len(subs)))
+    return subs, srt_path
+
+
 def merge_cuts(cuts: list) -> list:
     """重なったカットを1つにまとめる"""
     merged = []
@@ -402,7 +439,8 @@ def run_encode(input_args: list, graph: str, dst: Path, out_duration: float,
     raise AutocutError("書き出しに失敗しました:\n" + last_error)
 
 
-def render(src: Path, dst: Path, keeps: list, meta: dict, out_cfg: dict, enc_cfg: dict) -> None:
+def render(src: Path, dst: Path, keeps: list, meta: dict, out_cfg: dict, enc_cfg: dict, overlay=None) -> None:
+    """overlay: 字幕を描いた画像の並び順ファイル（カットしたあとの時間で作ったもの）"""
     fps = meta["fps"] if out_cfg["fps"] == "source" else snap_fps(float(out_cfg["fps"]))
     w, h = int(out_cfg["width"]), int(out_cfg["height"])
     hdr, color_args = hdr_filters(meta)
@@ -412,13 +450,19 @@ def render(src: Path, dst: Path, keeps: list, meta: dict, out_cfg: dict, enc_cfg
            "setpts=N/FRAME_RATE/TB"]
           + hdr
           + ["scale={}:{}:force_original_aspect_ratio=decrease".format(w, h),
-             "pad={}:{}:(ow-iw)/2:(oh-ih)/2".format(w, h), "setsar=1", "format=yuv420p"])
+             "pad={}:{}:(ow-iw)/2:(oh-ih)/2".format(w, h), "setsar=1"])
     # 音声は細かく刻んでから選ぶ（カットを重ねても映像と音がずれないように）
     af = ["aresample=48000", "asetnsamples=n=128:p=0",
           "aselect='{}'".format(select_expr(keeps)), "asetpts=N/SR/TB"]
-    graph = "[0:{}]{}[v];[0:{}]{}[a]".format(
-        meta["video_index"], ",".join(vf), meta["audio_index"], ",".join(af))
-    run_encode(["-i", str(src)], graph, dst, sum(b - a for a, b in keeps), enc_cfg, color_args)
+    inputs = ["-i", str(src)]
+    if overlay:
+        inputs += ["-f", "concat", "-safe", "0", "-i", str(overlay)]
+        graph = ("[0:{}]{}[base];[1:v]format=rgba[txt];[base][txt]overlay=0:0:eof_action=repeat,format=yuv420p[v];"
+                 "[0:{}]{}[a]").format(meta["video_index"], ",".join(vf), meta["audio_index"], ",".join(af))
+    else:
+        graph = "[0:{}]{},format=yuv420p[v];[0:{}]{}[a]".format(
+            meta["video_index"], ",".join(vf), meta["audio_index"], ",".join(af))
+    run_encode(inputs, graph, dst, sum(b - a for a, b in keeps), enc_cfg, color_args)
 
 
 # ------------------------------------------------------------
@@ -431,12 +475,18 @@ def main(argv=None) -> int:
     p.add_argument("--cuts", type=Path, help="手で直したカット一覧（CSV）を使って書き出し直す")
     p.add_argument("--list-only", action="store_true", help="動画は書き出さず、カット一覧だけ作る（設定の調整用）")
     p.add_argument("--quick", action="store_true", help="文字起こしをせず、音量による無音カットだけにする（速い）")
+    p.add_argument("--no-subs", action="store_true", help="字幕を入れない")
+    p.add_argument("--srt", type=Path, help="手で直した字幕ファイル（.srt）を使って、字幕を入れる")
     args = p.parse_args(argv)
 
     src = args.video.expanduser()
     if not src.is_file():
         raise AutocutError(f"動画ファイルが見つかりません: {src}")
     cfg = load_config(args.config)
+    if not args.no_subs and cfg["subtitle"]["enabled"] and not args.list_only and (not args.quick or args.srt):
+        import speech
+        # 字幕の文字を描く部品が入った Python に、最初に切り替えておく（途中で切り替えると最初からやり直しになるため）
+        speech.ensure_module("PIL", required=False)
     out_dir = src.parent / (src.stem + "_autocut")
     out_dir.mkdir(exist_ok=True)
     csv_path = out_dir / (src.stem + "_cuts.csv")
@@ -494,12 +544,22 @@ def main(argv=None) -> int:
         print("✔ カット一覧だけ作りました: " + str(csv_path))
         return 0
 
+    subs, srt_path = make_subtitles(src, out_dir, cuts, keeps, cfg, args)
     print("▶ YouTube用（{}x{}）に書き出します".format(cfg["youtube"]["width"], cfg["youtube"]["height"]))
-    render(src, out_path, keeps, meta, cfg["youtube"], cfg["encode"])
+    with tempfile.TemporaryDirectory() as work:
+        overlay = None
+        if subs and cfg["youtube"].get("burn_subtitles", True):
+            import telop
+            w, h = int(cfg["youtube"]["width"]), int(cfg["youtube"]["height"])
+            _, sub_style = telop.styles(cfg, w, h, "yoko")
+            overlay = telop.build_overlay(Path(work), w, h, kept, "", 0, subs, sub_style, sub_style)
+        render(src, out_path, keeps, meta, cfg["youtube"], cfg["encode"], overlay)
     print("✔ 完成しました")
     print("  動画      : " + str(out_path))
     if not args.cuts:
         print("  カット一覧: " + str(csv_path))
+    if srt_path:
+        print("  字幕      : " + str(srt_path))
     return 0
 
 

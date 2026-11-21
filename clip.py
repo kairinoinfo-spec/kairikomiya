@@ -34,8 +34,7 @@ from autocut import AutocutError
 
 HERE = Path(__file__).resolve().parent
 # ツールを新しくダウンロードし直しても消えないように、大きなものはここに置く
-from speech import APP_DIR  # noqa: E402
-VENVS = [APP_DIR / "venv", HERE / ".venv"]
+from speech import APP_DIR, ensure_module  # noqa: E402,F401
 
 # 料金の目安を表示するための単価（100万トークンあたりのドル: 入力, 出力）
 PRICES = {
@@ -109,24 +108,6 @@ SYSTEM_PROMPT = """\
 # ------------------------------------------------------------
 # 準備の確認
 # ------------------------------------------------------------
-def ensure_module(name: str, required: bool = True) -> bool:
-    """追加の部品（anthropic / cv2）が入った専用の Python で動かし直す"""
-    try:
-        __import__(name)
-        return True
-    except ImportError:
-        pass
-    for venv in VENVS:
-        venv_python = venv / "bin" / "python"
-        if venv_python.exists() and Path(sys.prefix).resolve() != venv.resolve():
-            os.execv(str(venv_python), [str(venv_python)] + sys.argv)
-    if required:
-        raise AutocutError(
-            "切り抜き機能の準備がまだです。ターミナルで次を実行してください"
-            "（setup.sh はドラッグ＆ドロップできます）:\n    bash " + shlex.quote(str(HERE / "setup.sh")))
-    return False
-
-
 def load_api_key():
     """api_key.txt の中身を返す。無ければ None"""
     key_file = HERE / "api_key.txt"

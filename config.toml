@@ -28,6 +28,10 @@ height = 1080
 # 1秒あたりのコマ数。"source" にすると元の動画と同じになります（30 や 60 と数字でも指定可）
 fps = "source"
 
+# 字幕を動画に焼き込むか（true: 焼き込む / false: .srt だけ作る。YouTube に .srt をアップロードして字幕にする場合）
+# 字幕の大きさ・色・位置は、下のほうの [subtitle] で変えられます
+burn_subtitles = true
+
 
 [encode]
 # 書き出し方式

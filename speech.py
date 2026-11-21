@@ -6,11 +6,13 @@ autocut.py と clip.py の両方から使います。Python の追加部品は�
 from __future__ import annotations
 
 import json
+import os
 import platform
 import re
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -23,6 +25,7 @@ if platform.system() == "Darwin":
     APP_DIR = Path.home() / "Library" / "Application Support" / "kairikomiya"
 else:
     APP_DIR = Path.home() / ".local" / "share" / "kairikomiya"
+VENVS = [APP_DIR / "venv", HERE / ".venv"]
 MODEL_URL = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-{}.bin"
 # 単語ごとの時間を正確にするための設定名（whisper.cpp の DTW）
 DTW_PRESETS = {"tiny": "tiny", "base": "base", "small": "small", "medium": "medium",
@@ -31,6 +34,24 @@ DTW_PRESETS = {"tiny": "tiny", "base": "base", "small": "small", "medium": "medi
 # 音楽や無音のところで、Whisper が実際には言っていない言葉を出してしまうことがある
 HALLUCINATIONS = ("大きな音楽", "おやすみなさい", "ご視聴ありがとうございました", "音楽", "拍手", "笑")
 PUNCT = "、。，．,.！？!?…「」『』（）() 　"
+
+
+def ensure_module(name: str, required: bool = True) -> bool:
+    """追加の部品（anthropic / cv2 / PIL など）が入った専用の Python で動かし直す"""
+    try:
+        __import__(name)
+        return True
+    except ImportError:
+        pass
+    for venv in VENVS:
+        venv_python = venv / "bin" / "python"
+        if venv_python.exists() and Path(sys.prefix).resolve() != venv.resolve():
+            os.execv(str(venv_python), [str(venv_python)] + sys.argv)
+    if required:
+        raise AutocutError(
+            "追加の部品がまだ入っていません。ターミナルで次を実行してください"
+            "（setup.sh はドラッグ＆ドロップできます）:\n    bash " + shlex.quote(str(HERE / "setup.sh")))
+    return False
 
 
 # ------------------------------------------------------------
