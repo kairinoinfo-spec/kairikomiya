@@ -26,7 +26,7 @@ if __name__ == "__main__":
 
 DEFAULTS = {
     "silence": {"threshold_db": -35, "min_silence": 0.6, "pad_before": 0.15, "pad_after": 0.25},
-    "youtube": {"width": 1920, "height": 1080, "fps": "source", "burn_subtitles": True},
+    "youtube": {"width": 1920, "height": 1080, "fps": "source", "burn_subtitles": True, "shapes": ["yoko"]},
     "encode": {"encoder": "auto", "video_bitrate": "12M", "crf": 18, "audio_bitrate": "192k"},
     "transcribe": {"model": "auto", "language": "ja", "hints": []},
     "cut": {"words": True, "fillers_enabled": True, "repeats_enabled": True, "restarts_enabled": True,
@@ -452,18 +452,28 @@ def run_encode(input_args: list, graph: str, dst: Path, out_duration: float,
     raise AutocutError("書き出しに失敗しました:\n" + last_error)
 
 
-def render(src: Path, dst: Path, keeps: list, meta: dict, out_cfg: dict, enc_cfg: dict, overlay=None) -> None:
-    """overlay: 字幕を描いた画像の並び順ファイル（カットしたあとの時間で作ったもの）"""
+def render(src: Path, dst: Path, keeps: list, meta: dict, out_cfg: dict, enc_cfg: dict, overlay=None,
+           size=None, crop=None) -> None:
+    """overlay: 字幕を描いた画像の並び順ファイル（カットしたあとの時間で作ったもの）
+    size: 書き出す (幅, 高さ)。crop: 切り出す (幅, 高さ, 左, 上, 切り出し位置を動かす指示ファイル or None)"""
     fps = meta["fps"] if out_cfg["fps"] == "source" else snap_fps(float(out_cfg["fps"]))
-    w, h = int(out_cfg["width"]), int(out_cfg["height"])
+    w, h = size or (int(out_cfg["width"]), int(out_cfg["height"]))
     hdr, color_args = hdr_filters(meta)
     vf = (["fps={}/{}".format(fps.numerator, fps.denominator),
            # コマの時刻は誤差を含むので、半コマ分ずらして判定する
            "select='{}'".format(select_expr(keeps, shift=float(1 / fps) / 2)),
            "setpts=N/FRAME_RATE/TB"]
-          + hdr
-          + ["scale={}:{}:force_original_aspect_ratio=decrease".format(w, h),
-             "pad={}:{}:(ow-iw)/2:(oh-ih)/2".format(w, h), "setsar=1"])
+          + hdr)
+    if crop:
+        cw, ch, x, y, cmds = crop
+        if cmds:  # カットしたあとの時間で、切り出し位置を少しずつ動かす
+            vf += ["sendcmd=f='{}'".format(cmds), "crop@follow={}:{}:{}:{}".format(cw, ch, x, y)]
+        else:
+            vf += ["crop={}:{}:{}:{}".format(cw, ch, x, y)]
+        vf += ["scale={}:{}".format(w, h), "setsar=1"]
+    else:
+        vf += ["scale={}:{}:force_original_aspect_ratio=decrease".format(w, h),
+               "pad={}:{}:(ow-iw)/2:(oh-ih)/2".format(w, h), "setsar=1"]
     # 音声は細かく刻んでから選ぶ（カットを重ねても映像と音がずれないように）
     af = ["aresample=48000", "asetnsamples=n=128:p=0",
           "aselect='{}'".format(select_expr(keeps)), "asetpts=N/SR/TB"]
@@ -490,6 +500,9 @@ def main(argv=None) -> int:
     p.add_argument("--quick", action="store_true", help="文字起こしをせず、音量による無音カットだけにする（速い）")
     p.add_argument("--no-subs", action="store_true", help="字幕を入れない")
     p.add_argument("--srt", type=Path, help="手で直した字幕ファイル（.srt）を使って、字幕を入れる")
+    p.add_argument("--shape", nargs="+", metavar="形",
+                   help="書き出す形。yoko（横 16:9）/ tate（縦 9:16）/ square（1:1）/ feed（4:5）。複数並べると全部作る")
+    p.add_argument("--pos", type=float, help="縦などに切り出す位置（0=左端、50=中央、100=右端）。省略すると人物に合わせる")
     args = p.parse_args(argv)
 
     src = args.video.expanduser()
@@ -562,17 +575,56 @@ def main(argv=None) -> int:
         return 0
 
     subs, srt_path = make_subtitles(src, out_dir, cuts, keeps, cfg, args)
-    print("▶ YouTube用（{}x{}）に書き出します".format(cfg["youtube"]["width"], cfg["youtube"]["height"]))
-    with tempfile.TemporaryDirectory() as work:
-        overlay = None
-        if subs and cfg["youtube"].get("burn_subtitles", True):
-            import telop
-            w, h = int(cfg["youtube"]["width"]), int(cfg["youtube"]["height"])
-            _, sub_style = telop.styles(cfg, w, h, "yoko")
-            overlay = telop.build_overlay(Path(work), w, h, kept, "", 0, subs, sub_style, sub_style)
-        render(src, out_path, keeps, meta, cfg["youtube"], cfg["encode"], overlay)
+    import clip as cliptool
+    shapes = cliptool.parse_shapes(" ".join(args.shape or [])) or \
+        cliptool.parse_shapes(" ".join(cfg["youtube"].get("shapes", ["yoko"]))) or ["yoko"]
+    made = []
+    subject = None
+    needs_crop = any(s != "yoko" for s in shapes)
+    if needs_crop and args.pos is None:
+        import speech
+        speech.ensure_module("cv2", required=False)
+        print("▶ 人物の位置を調べています（縦・正方形に切り出すため）")
+        subject = cliptool.find_subject(src, meta, 0.0, meta["duration"])
+        if subject:
+            print("  {}を見つけました（左から {:.0f}%）".format(subject["kind"], subject["x"] * 100))
+        else:
+            print("  見つからなかったので、中央で切り出します")
+    for shape in shapes:
+        if shape == "yoko":
+            label, w, h = "横", int(cfg["youtube"]["width"]), int(cfg["youtube"]["height"])
+            dst = out_path
+        else:
+            label, w, h = cliptool.SHAPES[shape]
+            dst = out_dir / "{}_{}.mp4".format(stem, label)
+        print("▶ {}（{}x{}）に書き出します".format("YouTube用" if shape == "yoko" else label, w, h))
+        with tempfile.TemporaryDirectory() as work:
+            overlay = None
+            if subs and cfg["youtube"].get("burn_subtitles", True):
+                import telop
+                _, sub_style = telop.styles(cfg, w, h, shape)
+                overlay = telop.build_overlay(Path(work), w, h, kept, "", 0, subs, sub_style, sub_style)
+            crop = None
+            if shape != "yoko":
+                cw, ch, x, y = cliptool.crop_box(meta, w, h, subject, args.pos)
+                cmds = None
+                if subject and args.pos is None and cw < meta["width"]:
+                    subj, follow = cliptool.place_subject(subject, cw / meta["width"], cfg["crop"]["follow"],
+                                                          meta["duration"], src=src, meta=meta, start=0.0)
+                    cw, ch, x, y = cliptool.crop_box(meta, w, h, subj, None)
+                    if follow:
+                        import telop
+                        # 元の動画の時間 → カットしたあとの時間に直す（カットした部分は捨てる）
+                        out_follow = [(telop.to_output_time(t, keeps), fx) for t, fx in follow
+                                      if any(a <= t < b for a, b in keeps)]
+                        if out_follow:
+                            cmds = cliptool.write_follow_cmds(Path(work), shape, out_follow, meta["width"], cw)
+                crop = (cw, ch, x, y, cmds)
+            render(src, dst, keeps, meta, cfg["youtube"], cfg["encode"], overlay, size=(w, h), crop=crop)
+        made.append(dst)
     print("✔ 完成しました")
-    print("  動画      : " + str(out_path))
+    for f in made:
+        print("  動画      : " + str(f))
     if not args.cuts:
         print("  カット一覧: " + str(csv_path))
     if srt_path:

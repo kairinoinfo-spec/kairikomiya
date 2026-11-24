@@ -32,6 +32,11 @@ fps = "source"
 # 字幕の大きさ・色・位置は、下のほうの [subtitle] で変えられます
 burn_subtitles = true
 
+# 書き出す形（コマンドで --shape を付けなかったときに使われます）
+#   "yoko"（横 16:9）/ "tate"（縦 9:16）/ "square"（正方形 1:1）/ "feed"（4:5）
+#   例: shapes = ["yoko", "tate"]  … 横と縦の両方を作る
+shapes = ["yoko"]
+
 
 [encode]
 # 書き出し方式

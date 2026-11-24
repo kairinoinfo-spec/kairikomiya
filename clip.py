@@ -463,6 +463,97 @@ def find_subject(src: Path, meta: dict, start: float, length: float):
     return None
 
 
+def two_people(track: list, width_frac: float):
+    """人の位置が左右2か所に分かれているか（対談など）。分かれていれば、
+    多く写っている方の横位置と「左」「右」を返す。そうでなければ None"""
+    xs = sorted(p[1] for p in track)
+    if len(xs) < 6:
+        return None
+    gaps = [(xs[i + 1] - xs[i], i) for i in range(len(xs) - 1)]
+    gap, i = max(gaps)
+    left, right = xs[:i + 1], xs[i + 1:]
+    if gap < width_frac * 0.5 or min(len(left), len(right)) < len(xs) * 0.2:
+        return None
+    side = left if len(left) >= len(right) else right
+    x = side[len(side) // 2]
+    return x, ("左" if side is left else "右")
+
+
+def scene_cuts(src: Path, meta: dict, start: float, length: float) -> list:
+    """カメラの切り替え（画面全体が一気に変わる瞬間）の時間を、start からの秒で返す"""
+    try:
+        import numpy as np
+    except ImportError:
+        return []
+    w = 96
+    h = max(2, int(round(meta["height"] * w / meta["width"] / 2)) * 2)
+    r = subprocess.run(["ffmpeg", "-v", "error", "-ss", "{:.3f}".format(start), "-t", "{:.3f}".format(length),
+                        "-i", str(src), "-map", "0:{}".format(meta["video_index"]),
+                        "-vf", "fps=10,scale={}:{}".format(w, h), "-f", "rawvideo", "-pix_fmt", "gray", "-"],
+                       stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    count = len(r.stdout) // (w * h)
+    if r.returncode != 0 or count < 3:
+        return []
+    f = np.frombuffer(r.stdout[:count * w * h], dtype=np.uint8).reshape(count, h, w).astype(np.int16)
+    diff = np.abs(f[1:] - f[:-1]).mean(axis=(1, 2))
+    level = max(30.0, float(np.median(diff)) * 6)
+    return [(i + 1) * 0.1 for i in np.nonzero(diff > level)[0]]
+
+
+def place_subject(subject, width_frac: float, follow_on: bool, length: float, quiet: bool = False,
+                  src=None, meta=None, start: float = 0.0):
+    """人物の位置から、切り出し方を決める。(subject, follow) を返す"""
+    if not subject:
+        return None, None
+    track = subject["track"]
+    pair = two_people(track, width_frac)
+    if pair:
+        xs = sorted(p[1] for p in track)
+        gap_i = max(range(len(xs) - 1), key=lambda i: xs[i + 1] - xs[i])
+        split = (xs[gap_i] + xs[gap_i + 1]) / 2
+        left = [x for x in xs if x < split]
+        right = [x for x in xs if x >= split]
+        centers = {"L": left[len(left) // 2], "R": right[len(right) // 2]}
+        labels = ["L" if p[1] < split else "R" for p in track]
+        runs, n = [], 1
+        for a, b in zip(labels, labels[1:]):
+            if a == b:
+                n += 1
+            else:
+                runs.append(n)
+                n = 1
+        runs.append(n)
+        if follow_on and sum(runs) / len(runs) >= 3:
+            # カメラが話している人に切り替わる編集 → 切り替えに合わせて、切り出す位置も切り替える
+            switches = []  # (時間, 切り替わった先)
+            for (t0, _), (t1, _), l0, l1 in zip(track, track[1:], labels, labels[1:]):
+                if l0 != l1:
+                    switches.append(((t0 + t1) / 2, l1, t0, t1))
+            cuts = scene_cuts(src, meta, start, length) if src is not None else []
+            timed = []
+            for t, lab, t0, t1 in switches:
+                near = [c for c in cuts if t0 - 0.2 <= c <= t1 + 0.2]
+                timed.append((min(near, key=lambda c: abs(c - t)) if near else t, lab))
+            path, cur, k = [], labels[0], 0
+            t = 0.0
+            while t <= length + 0.05:
+                while k < len(timed) and timed[k][0] <= t:
+                    cur = timed[k][1]
+                    k += 1
+                path.append((round(t, 2), centers[cur]))
+                t += 0.1
+            if not quiet:
+                print("  2人が交互に映るので、カメラの切り替えに合わせて切り出す位置も切り替えます")
+            return dict(subject, x=centers[labels[0]]), path
+        if not quiet:
+            print("  2人写っているので、多く写っている{}の人に合わせて切り出します（位置は変えられます）".format(pair[1]))
+        return dict(subject, x=pair[0]), None
+    follow = follow_path(track, length, width_frac) if follow_on else None
+    if follow and not quiet:
+        print("  人物が左右に動くので、カメラを追いかけるように切り出します")
+    return subject, follow
+
+
 def follow_path(track: list, length: float, width_frac: float):
     """人物の横位置の動きを、なめらかなカメラの動き [(秒, 横位置), ...] にする。
     ほとんど動かないときは None（固定で切り出す）"""
@@ -584,11 +675,12 @@ def export_clips(src: Path, meta: dict, clips: list, out_dir: Path, cfg: dict, s
         for shape, label, tw, th in targets:
             cw, ch, x, y = crop_box(meta, tw, th, subject, clip["pos"])
             follow = None
-            if subject and cw < meta["width"] and cfg["crop"]["follow"]:
-                follow = follow_path(subject["track"], length, cw / meta["width"])
+            if subject and cw < meta["width"] and clip["pos"] is None:
+                subject, follow = place_subject(subject, cw / meta["width"], cfg["crop"]["follow"], length,
+                                                src=src, meta=meta, start=clip["start"])
+                cw, ch, x, y = crop_box(meta, tw, th, subject, clip["pos"])
             crop_filters = ["crop={}:{}:{}:{}".format(cw, ch, x, y)]
             if follow:
-                print("  人物が左右に動くので、カメラを追いかけるように切り出します")
                 crop_filters = ["sendcmd=f='{}'".format(write_follow_cmds(work_dir, shape, follow, meta["width"], cw)),
                                 "crop@follow={}:{}:{}:{}".format(cw, ch, x, y)]
             vf = (["fps={}/{}".format(fps.numerator, fps.denominator)] + hdr
