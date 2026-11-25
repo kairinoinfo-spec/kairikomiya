@@ -193,6 +193,11 @@ def probe(path: Path) -> dict:
         "width": width,
         "height": height,
         "hdr": video.get("color_transfer") in ("arib-std-b67", "smpte2084"),
+        "channels": int(audio.get("channels") or 2),
+        "sample_rate": int(audio.get("sample_rate") or 48000),
+        # カメラで撮った動画には、時刻（タイムコード）が 0 から始まらないものがある
+        "timecode": next((t["timecode"] for t in [info.get("format", {}).get("tags", {})]
+                          + [st.get("tags", {}) for st in info.get("streams", [])] if t.get("timecode")), None),
     }
 
 
@@ -318,7 +323,7 @@ def merge_cuts(cuts: list) -> list:
     """重なったカットを1つにまとめる"""
     merged = []
     for c in sorted(cuts, key=lambda c: c["start"]):
-        if merged and c["start"] <= merged[-1]["end"] + 0.05:
+        if merged and c["start"] <= merged[-1]["end"] + 0.25:  # 間に残る切れ端が短すぎるときも1つにまとめる
             m = merged[-1]
             m["end"] = max(m["end"], c["end"])
             if c["reason"] not in m["reason"].split("・"):
@@ -570,8 +575,13 @@ def main(argv=None) -> int:
     if not keeps:
         raise AutocutError("全部が無音と判定されました。config.toml の threshold_db をもっと小さい数字（例: -45）にしてください。")
 
+    import fcpxml
+    fcpxml_path = out_dir / (stem + "_FinalCutPro.fcpxml")
+    fcpxml.write_fcpxml(fcpxml_path, src, meta, keeps, cuts, stem + "（自動カット）")
+
     if args.list_only:
         print("✔ カット一覧だけ作りました: " + str(csv_path))
+        print("  Final Cut Pro 用: " + str(fcpxml_path))
         return 0
 
     subs, srt_path = make_subtitles(src, out_dir, cuts, keeps, cfg, args)
@@ -629,6 +639,7 @@ def main(argv=None) -> int:
         print("  カット一覧: " + str(csv_path))
     if srt_path:
         print("  字幕      : " + str(srt_path))
+    print("  Final Cut Pro 用: " + str(fcpxml_path))
     return 0
 
 
